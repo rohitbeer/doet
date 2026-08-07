@@ -49,6 +49,15 @@ Needs Node 20+, plus the `claude` and `codex` CLIs on `PATH` and already
 logged in.
 
 ```bash
+npm install -g github:BeerJii/doet
+```
+
+That builds `master` and puts `doet` on your `PATH`. Updating is the same
+command again — there is no separate update step, and no version to pin.
+
+From a clone, to work on doet itself:
+
+```bash
 npm install
 npm run build
 npm link          # puts `doet` on your PATH
@@ -458,6 +467,11 @@ only appeared when a debate ended could not do that. `meta.json` is rewritten
 whenever a session id or model changes, for the same reason: the run that most
 needs to be resumable is the one that never reached a clean exit.
 
+`DOET_HOME` moves all of it, config included. `npm run dev` sets it to
+`~/.doet-dev` on purpose: developing doet with doet is the normal case here,
+and a branch build sharing `~/.doet/config.json` with an installed doet writes
+config keys back that only make sense on the branch.
+
 `--resume` reopens the same directory and keeps appending to it, and it prefers
 the models the session was actually using over whatever your config says now.
 If one of the stored agent sessions can no longer be opened, that agent starts
@@ -466,7 +480,8 @@ fresh and says so rather than failing the whole resume.
 ## Development
 
 ```bash
-npm run dev                                    # run from source
+npm run dev                                    # run from source, DOET_HOME=~/.doet-dev
+npm run dev -- --cwd ~/somewhere               # note the --, or npm eats the flags
 npm run typecheck
 node scripts/probe-codex.mjs                   # codex handshake only
 node scripts/probe-models.mjs                  # what models your account has

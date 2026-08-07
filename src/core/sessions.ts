@@ -6,15 +6,15 @@ import {
   writeFileSync,
   existsSync,
 } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { Bus } from './bus.js';
 import type { SummarySource } from './config.js';
+import { DOET_HOME } from './paths.js';
 import type { DebateResult } from './conductor.js';
 import { AGENT_LABELS } from './relay.js';
 import { AGENT_IDS, type AgentId, type DoetEvent, type Effort } from './types.js';
 
-export const SESSIONS_DIR = join(homedir(), '.doet', 'sessions');
+export const SESSIONS_DIR = join(DOET_HOME, 'sessions');
 
 /**
  * Enough to reopen a doet session later: which agent sessions it was driving,
