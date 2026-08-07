@@ -8,8 +8,11 @@
  */
 
 export type AgentId = 'claude' | 'codex';
+export type CliId = AgentId;
+export type SlotId = 'a' | 'b';
 
 export const AGENT_IDS: AgentId[] = ['claude', 'codex'];
+export const SLOT_IDS: SlotId[] = ['a', 'b'];
 
 export function otherAgent(id: AgentId): AgentId {
   return id === 'claude' ? 'codex' : 'claude';
@@ -121,6 +124,11 @@ export interface Usage {
   outputTokens?: number;
   cachedTokens?: number;
   totalTokens?: number;
+  /**
+   * What the CLI itself says the session cost, when it says anything. Absent is
+   * not zero — it means that agent does not report cost, and doet estimates
+   * from tokens instead rather than inventing a number here.
+   */
   costUsd?: number;
 }
 
@@ -178,6 +186,39 @@ export type DebatePhase =
   | 'synthesizing'
   | 'done'
   | 'stopped';
+
+// ---------------------------------------------------------------------------
+// One-time messages
+// ---------------------------------------------------------------------------
+
+/**
+ * What happened to a message you sent one agent.
+ *
+ * All three mean it reached that agent and nothing else did; they differ only
+ * in whether there was work in progress to fold it into. Nothing is ever held
+ * back waiting for something else to happen — a message you send is a message
+ * that has been sent.
+ *
+ * `live`   — pushed into the running session there and then. When the CLI reads
+ *            it is the CLI's call, but the message is already in its hands, so
+ *            a long agentic turn can pick it up between steps.
+ * `queued` — the protocol has no channel into a running turn at all, so doet
+ *            holds the message for the few seconds until that turn ends.
+ * `sent`   — the agent was idle, so the message is simply its next turn, opened
+ *            immediately.
+ *
+ * For the first two the exchange stays open until the agent has answered the
+ * added message as well, so the result covers the request and the amendment.
+ */
+export type MessageDelivery = 'live' | 'queued' | 'sent';
+
+/**
+ * What an adapter managed on its own. `null` means there was no exchange in
+ * flight to add to, and the caller should open a turn instead — a decision the
+ * adapter deliberately does not make for it, since only the caller knows what
+ * else that would disturb.
+ */
+export type InFlightDelivery = 'live' | 'queued';
 
 // ---------------------------------------------------------------------------
 // Sessions
@@ -249,6 +290,59 @@ export interface TurnResult {
   error?: string;
 }
 
+export interface VsSlotResult {
+  slot: SlotId;
+  cli: CliId;
+  /** What the CLI resolved to, so a saved result can still be priced later. */
+  model: string;
+  branch: string;
+  worktree: string;
+  commit: string;
+  changed: boolean;
+  files: number;
+  insertions: number;
+  deletions: number;
+  diffstat: string;
+  commits: string[];
+  response: string;
+  usage: Usage;
+  /** Wall-clock time this slot spent on this exchange, add-on messages included. */
+  elapsedMs: number;
+  /** One-time messages you added to this exchange while it ran. */
+  addOns: number;
+  error?: string;
+}
+
+export interface VsResult {
+  query: string;
+  base: string;
+  slots: Record<SlotId, VsSlotResult>;
+  /**
+   * Wall clock for the run, which is the slower slot rather than the sum: both
+   * slots work at once, so adding their times would describe a race nobody ran.
+   */
+  elapsedMs: number;
+}
+
+/**
+ * What one slot has spent so far — read live by the UI while a run is in
+ * flight, and folded into `VsSlotResult` when it finishes.
+ *
+ * `activeMs` is time spent inside exchanges, not since the slot started, so a
+ * slot you left idle for ten minutes does not look like it worked for ten
+ * minutes.
+ */
+export interface VsSlotStats {
+  /** Exchanges this slot has completed. */
+  turns: number;
+  /** One-time messages added to this slot's exchanges. */
+  addOns: number;
+  activeMs: number;
+  /** Set while an exchange is in flight; the UI counts up from it. */
+  runningSince?: number;
+  usage: Usage;
+}
+
 export interface AgentAdapter {
   readonly id: AgentId;
   readonly label: string;
@@ -259,6 +353,24 @@ export interface AgentAdapter {
    * `label` is what the pane shows above the prompt it renders.
    */
   send(prompt: string, label?: string): Promise<TurnResult>;
+  /**
+   * Add one message to the exchange this agent is in the middle of.
+   *
+   * Distinct from `send`, which starts an exchange and is refused while one is
+   * running. This is the "I forgot to say" channel: the agent is already
+   * working, you have thought of something, and waiting for it to finish means
+   * correcting the wrong implementation instead of steering the right one.
+   *
+   * Whether the agent can hear you *now* or only at the next turn boundary is
+   * the CLI's business, not the caller's, so the promise resolves with which of
+   * the two happened. Either way the exchange stays open until the agent has
+   * answered the added message, so `send`'s result covers the whole thing.
+   *
+   * Resolves `null` when no exchange was in flight. It deliberately does not
+   * fall back to opening one: nothing is stored, nothing is deferred, and the
+   * caller sends the message as an ordinary turn instead.
+   */
+  addMessage(text: string): Promise<InFlightDelivery | null>;
   interrupt(): Promise<void>;
   /** Answer a pending permission request by option id. */
   resolvePermission(requestId: string, optionId: string): void;
@@ -268,12 +380,14 @@ export interface AgentAdapter {
   listModels(): Promise<ModelChoice[]>;
   setPermissionMode(mode: string): Promise<void>;
   listPermissionModes(): string[];
+  /** Move subsequent opens/resumes to another working tree. Never changes it mid-turn. */
+  setCwd(cwd: string): Promise<void>;
   /**
    * Retire the current session and open a fresh one. `carry` is prepended to
    * the next prompt rather than sent as a turn of its own, so a handoff costs
    * no extra round-trip.
    */
-  newSession(carry?: string): Promise<void>;
+  newSession(carry?: string, carried?: HandoffMode): Promise<void>;
   /**
    * Drop the live session so something else can own it, returning the id needed
    * to get it back. Null when there is no resumable session yet.

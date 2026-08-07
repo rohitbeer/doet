@@ -1,7 +1,7 @@
 {
   "name": "doet",
   "version": "0.1.0",
-  "description": "Two agent CLIs, one conversation. doet passes a question between Claude Code and Codex until they agree.",
+  "description": "Run coding agents together in co-code mode or compare isolated implementations in vs mode.",
   "type": "module",
   "bin": {
     "doet": "./dist/cli.js"

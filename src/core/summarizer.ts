@@ -84,6 +84,14 @@ export class Summarizer {
     this.gist = gist.trim();
   }
 
+  /** Start a genuinely fresh doet session, including the note-taker's context. */
+  async reset(): Promise<void> {
+    await this.dispose();
+    this.gist = '';
+    this.round = 0;
+    this.queue = Promise.resolve();
+  }
+
   /**
    * Swaps which agent keeps the notes. The old session is torn down; the digest
    * survives, since it is doet's, not the agent's.

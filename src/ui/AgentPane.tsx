@@ -1,9 +1,8 @@
-import React, { useMemo } from 'react';
+import React, { useEffect, useMemo } from 'react';
 import { Box, Text } from 'ink';
 import type { AgentId, AgentInfo } from '../core/types.js';
 import { AGENT_COLOR, SPINNER, STATUS_COLOR, STATUS_LABEL } from './theme.js';
 import { compactNumber, wrapLine } from '../core/util.js';
-import { isVerdictLine } from '../core/relay.js';
 import { Markdown, parseInline, wrapSpans, type Span } from './markdown.js';
 
 export type LineKind =
@@ -49,6 +48,12 @@ interface Props {
   /** Rows scrolled up from the bottom. 0 follows the live tail. */
   scroll: number;
   spinnerFrame: number;
+  /**
+   * What this pane has spent — time and tokens, already formatted. Passed in
+   * rather than derived here because only the caller knows when the clock
+   * started, and VS is the only mode that measures one.
+   */
+  meter?: string;
   onRows?: (rows: number, viewport: number) => void;
 }
 
@@ -62,6 +67,7 @@ export function AgentPane({
   focused,
   scroll,
   spinnerFrame,
+  meter,
   onRows,
 }: Props) {
   const color = AGENT_COLOR[agent];
@@ -81,7 +87,9 @@ export function AgentPane({
   const end = rows.length - offset;
   const visible = rows.slice(Math.max(0, end - viewport), end);
 
-  onRows?.(rows.length, viewport);
+  useEffect(() => {
+    onRows?.(rows.length, viewport);
+  }, [onRows, rows.length, viewport]);
 
   const following = offset === 0;
 
@@ -94,25 +102,48 @@ export function AgentPane({
       borderColor={focused ? 'white' : active ? color : 'gray'}
       paddingX={1}
     >
-      <Box>
-        <Text color={color} bold>
-          {info.label}
-        </Text>
-        <Text dimColor> {info.model || 'default'}</Text>
-        {info.effort && <Text dimColor>/{info.effort}</Text>}
-        {info.sessionSeq > 1 && <Text dimColor> #{info.sessionSeq}</Text>}
-        <Box flexGrow={1} />
-        {focused && <Text color="white">ctrl+o open </Text>}
-        {!following && (
-          <Text color="yellow">
-            ↑{offset}{' '}
+      {/*
+        One row, and it has to stay one row. The pane reserves exactly one for
+        it (`viewport = height - 3`), so a header that wraps does not get taller
+        — it pushes a row of the agent's output off the bottom of a pane whose
+        scrollback still believes it is there. Hence nowrap, and a left group
+        that truncates: at half a narrow terminal the model id is the least
+        useful thing here, and the status and the counters are the most.
+      */}
+      <Box flexWrap="nowrap" overflow="hidden">
+        <Box flexShrink={0}>
+          <Text color={color} bold>
+            {info.label}
           </Text>
-        )}
-        {busy && <Text color={color}>{SPINNER[spinnerFrame % SPINNER.length]} </Text>}
-        <Text color={STATUS_COLOR[info.status]}>{STATUS_LABEL[info.status]}</Text>
-        {info.usage.outputTokens != null && (
-          <Text dimColor> · {compactNumber(info.usage.outputTokens)}</Text>
-        )}
+        </Box>
+        <Box flexShrink={1} overflow="hidden">
+          <Text dimColor wrap="truncate-end">
+            {' '}
+            {info.model || 'default'}
+            {info.effort ? `/${info.effort}` : ''}
+            {info.sessionSeq > 1 ? ` #${info.sessionSeq}` : ''}
+          </Text>
+        </Box>
+        <Box flexGrow={1} flexShrink={1} />
+        <Box flexShrink={0}>
+          {focused && <Text color="white">enter open </Text>}
+          {!following && (
+            <Text color="yellow">
+              ↑{offset}{' '}
+            </Text>
+          )}
+          {busy && <Text color={color}>{SPINNER[spinnerFrame % SPINNER.length]} </Text>}
+          <Text color={STATUS_COLOR[info.status]}>{STATUS_LABEL[info.status]}</Text>
+          {/* One or the other, never both: a second counter is what pushed
+              this row over the edge in the first place. */}
+          {meter ? (
+            <Text dimColor> · {meter}</Text>
+          ) : (
+            info.usage.outputTokens != null && (
+              <Text dimColor> · {compactNumber(info.usage.outputTokens)}</Text>
+            )
+          )}
+        </Box>
       </Box>
 
       <Box flexDirection="column" flexGrow={1} overflow="hidden">
@@ -128,10 +159,6 @@ export function AgentPane({
 function layout(lines: PaneLine[], width: number): Row[] {
   const rows: Row[] = [];
   for (const line of lines) {
-    // doet's own control marker, which the agent was asked to emit and which
-    // is stripped everywhere else. The pane renders raw token deltas, so it has
-    // to drop the line itself rather than rely on the cleaned message.
-    if (line.kind === 'text' && isVerdictLine(line.text)) continue;
     // Prompt bodies get a gutter, so they wrap two columns narrower.
     const isPrompt = line.kind === 'prompt';
     const room = isPrompt ? Math.max(4, width - 2) : width;

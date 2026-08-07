@@ -1,4 +1,4 @@
-import type { AgentId, Verdict } from './types.js';
+import type { AgentId } from './types.js';
 
 /**
  * doet is a passer, not an agent: it never calls a model itself. The only
@@ -10,13 +10,6 @@ export const AGENT_LABELS: Record<AgentId, string> = {
   claude: 'Claude Code',
   codex: 'Codex',
 };
-
-/**
- * Agents end a debate turn with this marker so doet can tell "I'm satisfied"
- * from "I still disagree" without asking a third model to referee. The odd
- * delimiter is deliberate — it should never collide with real prose or code.
- */
-const VERDICT_PATTERN = /<<<\s*DOET:VERDICT\s+(AGREE|REVISE)\s*>>>/gi;
 
 interface SessionArgs {
   self: AgentId;
@@ -56,35 +49,6 @@ Write every reply as the finished answer to the human's request. The last one sa
 they receive, so any single reply should stand on its own — no status markers, no notes to
 doet, no meta-commentary about the session or about how many exchanges are left. If the
 answer is done, say it is done and stop adding to it.`;
-}
-
-/** Strip the control marker so it never leaks into the final deliverable. */
-export function stripVerdict(text: string): string {
-  return text.replace(VERDICT_PATTERN, '').trimEnd();
-}
-
-const VERDICT_PREFIX = '<<<DOET:VERDICT';
-
-/**
- * True for a line that is the control marker, or the beginning of one.
- *
- * `stripVerdict` cleans the authoritative message, but the panes render live
- * token deltas, where the marker arrives a few characters at a time and is
- * therefore never "complete" until the turn ends. Matching partial prefixes too
- * keeps `<<<DOET` from flashing up at the end of every turn.
- */
-export function isVerdictLine(text: string): boolean {
-  const trimmed = text.trim();
-  if (trimmed.length === 0 || trimmed[0] !== '<') return false;
-  return trimmed.startsWith(VERDICT_PREFIX) || VERDICT_PREFIX.startsWith(trimmed);
-}
-
-/** Read the agent's verdict. Last marker wins if a model emits more than one. */
-export function parseVerdict(text: string): Verdict | null {
-  const matches = [...text.matchAll(VERDICT_PATTERN)];
-  if (matches.length === 0) return null;
-  const last = matches[matches.length - 1]![1]!.toUpperCase();
-  return last === 'AGREE' ? 'AGREE' : 'REVISE';
 }
 
 /**
@@ -301,6 +265,25 @@ No verdict marker on this one.`;
 export function interjectionPrompt(text: string): string {
   return `The human broke in to tell you this directly. It takes priority — apply it, and
 carry it forward.
+
+<human>
+${text}
+</human>`;
+}
+
+/**
+ * Injected when the user adds a message to an exchange the agent is already
+ * working on.
+ *
+ * The last line is the whole point. Without it an agent that has been running
+ * for two minutes reads a new user message as a new request and starts over,
+ * throwing away the work the message was meant to redirect.
+ */
+export function addedMessagePrompt(text: string): string {
+  return `The human added this to the request you are working on right now. It takes
+priority over anything it contradicts. Fold it into the work in progress and
+carry on with the same task — do not start over, and do not treat it as a new
+request.
 
 <human>
 ${text}

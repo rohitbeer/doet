@@ -1,8 +1,9 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { DOET_HOME } from './paths.js';
-import type { AgentId, AgentSessionSettings, Effort } from './types.js';
+import { EFFORTS, type AgentId, type AgentSessionSettings, type Effort } from './types.js';
 import { DEFAULT_DEBATE, type DebateConfig } from './conductor.js';
+import { DEFAULT_PRICING, readPricing, type PricingTable } from './pricing.js';
 
 /** A model choice as the user made it: which model, and how hard it should think. */
 export interface ModelSetting {
@@ -44,7 +45,7 @@ export interface DoetConfig {
   branch: BranchSetting;
   /** Which agent receives the opening query when you don't pick one. */
   defaultFirst: AgentId;
-  debate: DebateConfig;
+  coCode: DebateConfig;
   summary: SummarySetting;
   sessions: Record<AgentId, AgentSessionSettings>;
   claude: {
@@ -54,6 +55,12 @@ export interface DoetConfig {
     approvalPolicy: string;
     sandbox: string;
   };
+  /**
+   * USD per million tokens, by model id, for the models whose CLI does not
+   * report a cost of its own. Yours to fill in — see `pricing.ts` for why doet
+   * ships none.
+   */
+  pricing: PricingTable;
 }
 
 export const DEFAULT_CONFIG: DoetConfig = {
@@ -66,7 +73,7 @@ export const DEFAULT_CONFIG: DoetConfig = {
   // editor, and guessing wrong is how you end up outside your editor.
   branch: { mode: 'ask' },
   defaultFirst: 'claude',
-  debate: DEFAULT_DEBATE,
+  coCode: DEFAULT_DEBATE,
   // Unanswered until first launch. Which agent takes the notes, and on what
   // model, is a cost decision doet has no business making for you.
   summary: { agent: 'ask', model: { id: '' }, targetWords: 220 },
@@ -80,6 +87,7 @@ export const DEFAULT_CONFIG: DoetConfig = {
   // `untrusted` + `workspace-write` is the combination that actually produces
   // prompts. Loosening either one silently removes the thing doet is for.
   codex: { approvalPolicy: 'untrusted', sandbox: 'workspace-write' },
+  pricing: DEFAULT_PRICING,
 };
 
 export const CONFIG_PATH = join(DOET_HOME, 'config.json');
@@ -87,31 +95,58 @@ export const CONFIG_PATH = join(DOET_HOME, 'config.json');
 export function loadConfig(): DoetConfig {
   try {
     if (!existsSync(CONFIG_PATH)) return clone(DEFAULT_CONFIG);
-    const raw = JSON.parse(readFileSync(CONFIG_PATH, 'utf8')) as Partial<DoetConfig>;
+    const parsed: unknown = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
+    if (!isRecord(parsed)) return clone(DEFAULT_CONFIG);
+    const raw = parsed;
+    const models = recordAt(raw.models);
+    const summary = recordAt(raw.summary);
+    const sessions = recordAt(raw.sessions);
+    const claude = recordAt(raw.claude);
+    const codex = recordAt(raw.codex);
+    const coCode = recordAt(raw.coCode);
+    const debate = recordAt(raw.debate);
+
     return {
-      ...DEFAULT_CONFIG,
-      ...raw,
       models: {
-        claude: readModel(raw.models?.claude, DEFAULT_CONFIG.models.claude),
-        codex: readModel(raw.models?.codex, DEFAULT_CONFIG.models.codex),
+        claude: readModel(models.claude, DEFAULT_CONFIG.models.claude),
+        codex: readModel(models.codex, DEFAULT_CONFIG.models.codex),
       },
-      branch: { ...DEFAULT_CONFIG.branch, ...raw.branch },
+      branch: readBranch(raw.branch),
+      defaultFirst: raw.defaultFirst === 'codex' ? 'codex' : 'claude',
       // Read field by field rather than spread. A config written by an older
       // doet still carries keys for behaviour that has since been removed, and
       // spreading them back in is how a deleted feature comes back to life on
       // one machine and not another.
-      debate: { maxRounds: readRounds(raw.debate?.maxRounds) },
+      coCode: { maxRounds: readRounds(coCode.maxRounds ?? debate.maxRounds) },
       summary: {
-        ...DEFAULT_CONFIG.summary,
-        ...raw.summary,
-        model: readModel(raw.summary?.model, DEFAULT_CONFIG.summary.model),
+        agent: isSummarySource(summary.agent) ? summary.agent : DEFAULT_CONFIG.summary.agent,
+        model: readModel(summary.model, DEFAULT_CONFIG.summary.model),
+        targetWords: readPositiveInteger(summary.targetWords, DEFAULT_CONFIG.summary.targetWords),
       },
       sessions: {
-        claude: { ...DEFAULT_CONFIG.sessions.claude, ...raw.sessions?.claude },
-        codex: { ...DEFAULT_CONFIG.sessions.codex, ...raw.sessions?.codex },
+        claude: readSessionSettings(sessions.claude, DEFAULT_CONFIG.sessions.claude),
+        codex: readSessionSettings(sessions.codex, DEFAULT_CONFIG.sessions.codex),
       },
-      claude: { ...DEFAULT_CONFIG.claude, ...raw.claude },
-      codex: { ...DEFAULT_CONFIG.codex, ...raw.codex },
+      claude: {
+        permissionMode: oneOf(
+          claude.permissionMode,
+          ['default', 'acceptEdits', 'plan', 'bypassPermissions'],
+          DEFAULT_CONFIG.claude.permissionMode,
+        ),
+      },
+      codex: {
+        approvalPolicy: oneOf(
+          codex.approvalPolicy,
+          ['untrusted', 'on-request', 'never'],
+          DEFAULT_CONFIG.codex.approvalPolicy,
+        ),
+        sandbox: oneOf(
+          codex.sandbox,
+          ['read-only', 'workspace-write', 'danger-full-access'],
+          DEFAULT_CONFIG.codex.sandbox,
+        ),
+      },
+      pricing: readPricing(raw.pricing),
     };
   } catch {
     // A broken config should not stop doet from starting.
@@ -126,16 +161,70 @@ export function loadConfig(): DoetConfig {
 function readRounds(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 1
     ? Math.floor(value)
-    : DEFAULT_DEBATE.maxRounds;
+    : DEFAULT_CONFIG.coCode.maxRounds;
 }
 
 function readModel(value: unknown, fallback: ModelSetting): ModelSetting {
   if (typeof value === 'string') return { id: value };
-  if (value && typeof value === 'object') {
-    const m = value as Partial<ModelSetting>;
-    if (typeof m.id === 'string') return { id: m.id, effort: m.effort };
+  if (isRecord(value) && typeof value.id === 'string') {
+    const effort = typeof value.effort === 'string'
+      && (EFFORTS as readonly string[]).includes(value.effort)
+      ? value.effort as Effort
+      : undefined;
+    return { id: value.id, ...(effort ? { effort } : {}) };
   }
   return { ...fallback };
+}
+
+function readBranch(value: unknown): BranchSetting {
+  const raw = recordAt(value);
+  const mode = oneOf(raw.mode, ['ask', 'copy', 'launcher', 'command'], DEFAULT_CONFIG.branch.mode);
+  if (mode === 'launcher' && typeof raw.launcher !== 'string') return { mode: 'ask' };
+  if (mode === 'command' && typeof raw.command !== 'string') return { mode: 'ask' };
+  return {
+    mode,
+    ...(typeof raw.launcher === 'string' ? { launcher: raw.launcher } : {}),
+    ...(typeof raw.command === 'string' ? { command: raw.command } : {}),
+  };
+}
+
+function readSessionSettings(
+  value: unknown,
+  fallback: AgentSessionSettings,
+): AgentSessionSettings {
+  const raw = recordAt(value);
+  const policy = recordAt(raw.policy);
+  let parsedPolicy: AgentSessionSettings['policy'] = { ...fallback.policy };
+  if (policy.mode === 'manual') parsedPolicy = { mode: 'manual' };
+  else if (policy.mode === 'rounds') {
+    const every = readPositiveInteger(policy.every, 0);
+    if (every > 0) parsedPolicy = { mode: 'rounds', every };
+  } else if (policy.mode === 'tokens') {
+    const limit = readPositiveInteger(policy.limit, 0);
+    if (limit > 0) parsedPolicy = { mode: 'tokens', limit };
+  }
+  const handoff = oneOf(raw.handoff, ['ask', 'gist', 'full', 'none'], fallback.handoff);
+  return { policy: parsedPolicy, handoff };
+}
+
+function readPositiveInteger(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 ? value : fallback;
+}
+
+function isSummarySource(value: unknown): value is SummarySource {
+  return value === 'claude' || value === 'codex' || value === 'off' || value === 'ask';
+}
+
+function oneOf<const T extends string>(value: unknown, choices: readonly T[], fallback: T): T {
+  return typeof value === 'string' && choices.includes(value as T) ? value as T : fallback;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function recordAt(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {};
 }
 
 export function saveConfig(config: DoetConfig): void {
@@ -150,15 +239,17 @@ function clone(config: DoetConfig): DoetConfig {
 
 /** `manual`, `rounds:4`, `tokens:120000` — the `/session … policy` argument. */
 export function parseSessionPolicy(value: string): AgentSessionSettings['policy'] | null {
-  if (value === 'manual') return { mode: 'manual' };
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'manual') return { mode: 'manual' };
 
-  const [mode, rawAmount] = value.split(':');
-  const amount = Number(rawAmount);
-  if (!Number.isFinite(amount) || amount < 1) return null;
+  const match = /^(rounds|tokens):([1-9]\d*)$/.exec(normalized);
+  if (!match) return null;
+  const amount = Number(match[2]);
+  if (!Number.isSafeInteger(amount)) return null;
 
-  if (mode === 'rounds') return { mode: 'rounds', every: Math.floor(amount) };
-  if (mode === 'tokens') return { mode: 'tokens', limit: Math.floor(amount) };
-  return null;
+  return match[1] === 'rounds'
+    ? { mode: 'rounds', every: amount }
+    : { mode: 'tokens', limit: amount };
 }
 
 export function describeSessionPolicy(policy: AgentSessionSettings['policy']): string {

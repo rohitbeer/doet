@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Bus } from '../bus.js';
-import { AGENT_LABELS, parseVerdict, stripVerdict } from '../relay.js';
+import { AGENT_LABELS, addedMessagePrompt } from '../relay.js';
 import {
   ALLOW_ONCE,
   ALLOW_SESSION,
@@ -9,6 +9,8 @@ import {
   type AgentInfo,
   type AgentStatus,
   type Effort,
+  type HandoffMode,
+  type InFlightDelivery,
   type ModelChoice,
   type PermissionOption,
   type PermissionRequest,
@@ -37,6 +39,12 @@ const QUIET_ITEMS = new Set(['agentMessage', 'reasoning', 'userMessage', 'plan',
 export interface CodexAdapterOptions {
   bus: Bus;
   cwd: string;
+  /**
+   * Additional absolute paths the Codex sandbox may write. VS uses this for
+   * the repository's shared git metadata: a linked worktree cannot create
+   * commits or update its branch without it.
+   */
+  workspaceRoots?: string[];
   model: string;
   effort?: Effort;
   approvalPolicy?: string;
@@ -86,6 +94,13 @@ export class CodexAdapter implements AgentAdapter {
   private turn: Deferred<TurnResult> | null = null;
   private turnText = '';
   private interruptedTurn = false;
+  /**
+   * Replies already collected in this exchange. Codex answers each added
+   * message as its own turn, so the text doet hands back is the legs joined.
+   */
+  private turnLegs: string[] = [];
+  /** Added messages waiting for the current turn to end. */
+  private readonly queuedAddOns: string[] = [];
 
   private readonly pending = new Map<string, Deferred<unknown>>();
   /** Approval kinds the user green-lit for the rest of the session. */
@@ -113,6 +128,71 @@ export class CodexAdapter implements AgentAdapter {
     this.effort = opts.effort;
     this.approvalPolicy = opts.approvalPolicy ?? 'untrusted';
     this.sandbox = opts.sandbox ?? 'workspace-write';
+  }
+
+  /**
+   * Extra writable paths for a `workspace-write` thread, as a per-thread config
+   * override.
+   *
+   * VS mode needs this: each agent works in a `git worktree`, whose `.git` is a
+   * file pointing at `<repo>/.git/worktrees/<slot>`. That path is outside the
+   * agent's cwd, so under `workspace-write` every git write the agent attempts
+   * — `git add`, `git commit`, `git stash` — is refused by the sandbox.
+   *
+   * `thread/start` also accepts a `runtimeWorkspaceRoots` field that does the
+   * same job, and it is the more purpose-built of the two. It is not used,
+   * because the app-server gates it:
+   *
+   *     thread/start.runtimeWorkspaceRoots requires experimentalApi capability
+   *
+   * and the only way to unlock it is to declare `experimentalApi` at
+   * `initialize` — which opts this client into experimental *notifications*
+   * too, the very messages `handleNotification` parses to draw the panes. A
+   * sandbox tweak is not worth putting the whole event stream on an
+   * experimental footing. `config` is an ordinary, ungated parameter.
+   *
+   * These are additional roots: cwd is already writable and is not repeated.
+   */
+  private sandboxConfig(): Record<string, unknown> | undefined {
+    const roots = this.opts.workspaceRoots?.filter((root) => root && root !== this.opts.cwd);
+    if (!roots?.length) return undefined;
+    return { sandbox_workspace_write: { writable_roots: [...new Set(roots)] } };
+  }
+
+  /**
+   * Opens a thread with the sandbox override, and again without it if this
+   * app-server will not take it.
+   *
+   * A Codex that rejects the parameter must not be able to stop a VS run from
+   * starting — but it also must not do so quietly, because the agent will then
+   * hit a refusal the first time it touches git and nothing on screen would say
+   * why. So the retry is loud.
+   */
+  private async request<T>(
+    method: string,
+    params: Record<string, unknown>,
+    config?: Record<string, unknown>,
+  ): Promise<T> {
+    if (!this.rpc) throw new Error('Codex adapter is not started.');
+    if (!config) return this.rpc.request<T>(method, params);
+
+    try {
+      return await this.rpc.request<T>(method, { ...params, config });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // Retry only when the override itself is what this Codex rejected. An
+      // auth, model, thread-lock, or server failure must retain its real error
+      // instead of being mislabeled as a sandbox compatibility problem.
+      if (!/(?:config|sandbox_workspace_write|writable_roots|unknown field)/i.test(message)) {
+        throw error;
+      }
+      this.bus.log(
+        this.id,
+        `Codex would not take the sandbox override (${message}). Continuing without it — git commands inside the worktree may be refused by the sandbox.`,
+        'warn',
+      );
+      return this.rpc.request<T>(method, params);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -200,15 +280,19 @@ export class CodexAdapter implements AgentAdapter {
   async resumeSession(threadId: string): Promise<void> {
     this.setStatus('starting');
     await this.connect();
-    await this.rpc!.request('thread/resume', {
-      threadId,
-      cwd: this.opts.cwd,
-      approvalPolicy: this.approvalPolicy,
-      sandbox: this.sandbox,
-      ...(this.model ? { model: this.model } : {}),
-      // Re-asserted on resume, or a reopened thread loses the framing.
-      ...(this.opts.instructions ? { developerInstructions: this.opts.instructions } : {}),
-    });
+    await this.request(
+      'thread/resume',
+      {
+        threadId,
+        cwd: this.opts.cwd,
+        approvalPolicy: this.approvalPolicy,
+        sandbox: this.sandbox,
+        ...(this.model ? { model: this.model } : {}),
+        // Re-asserted on resume, or a reopened thread loses the framing.
+        ...(this.opts.instructions ? { developerInstructions: this.opts.instructions } : {}),
+      },
+      this.sandboxConfig(),
+    );
     // Same conversation, so the turn counter and transcript carry on.
     this.threadId = threadId;
     this.setStatus('ready');
@@ -274,19 +358,27 @@ export class CodexAdapter implements AgentAdapter {
   private async openThread(): Promise<void> {
     if (!this.rpc) throw new Error('Codex adapter is not started.');
 
-    const started = await this.rpc.request<{ thread?: { id?: string } }>('thread/start', {
+    const params = {
       // Omit entirely when unknown so Codex falls back to its own default.
       ...(this.model ? { model: this.model } : {}),
       ...(this.opts.instructions ? { developerInstructions: this.opts.instructions } : {}),
       cwd: this.opts.cwd,
       approvalPolicy: this.approvalPolicy,
       sandbox: this.sandbox,
-    });
+    };
+    const config = this.sandboxConfig();
+
+    const started = await this.request<{ thread?: { id?: string } }>(
+      'thread/start',
+      params,
+      config,
+    );
     this.threadId = started?.thread?.id ?? null;
     if (!this.threadId) throw new Error('codex did not return a thread id');
 
     this.sessionSeq += 1;
     this.sessionTurns = 0;
+    this.usage = {};
     this.transcript = [];
   }
 
@@ -294,7 +386,7 @@ export class CodexAdapter implements AgentAdapter {
    * Retires this thread and opens a fresh one. Codex threads are server-side,
    * so this is a new `thread/start` rather than a process restart.
    */
-  async newSession(carry?: string): Promise<void> {
+  async newSession(carry?: string, carried: HandoffMode = carry ? 'full' : 'none'): Promise<void> {
     await this.openThread();
     this.carry = carry?.trim() ? carry.trim() : null;
     this.setStatus('ready');
@@ -302,8 +394,38 @@ export class CodexAdapter implements AgentAdapter {
       kind: 'session',
       agent: this.id,
       sessionId: this.threadId ?? undefined,
-      carried: carry ? 'full' : 'none',
+      carried,
     });
+  }
+
+  async setCwd(cwd: string): Promise<void> {
+    if (cwd === this.opts.cwd) return;
+    if (this.turn) throw new Error('Cannot move Codex while it is mid-turn.');
+
+    const threadId = this.threadId;
+    this.rpc?.stop();
+    this.rpc = null;
+    this.opts.cwd = cwd;
+    this.setStatus('starting');
+    await this.connect();
+    if (threadId) {
+      await this.request(
+        'thread/resume',
+        {
+          threadId,
+          cwd,
+          approvalPolicy: this.approvalPolicy,
+          sandbox: this.sandbox,
+          ...(this.model ? { model: this.model } : {}),
+          ...(this.opts.instructions ? { developerInstructions: this.opts.instructions } : {}),
+        },
+        this.sandboxConfig(),
+      );
+      this.threadId = threadId;
+    } else {
+      await this.openThread();
+    }
+    this.setStatus('ready');
   }
 
   async dispose(): Promise<void> {
@@ -329,6 +451,8 @@ export class CodexAdapter implements AgentAdapter {
     this.carry = null;
 
     this.turnText = '';
+    this.turnLegs = [];
+    this.queuedAddOns.length = 0;
     this.interruptedTurn = false;
     this.turn = new Deferred<TurnResult>();
     this.sessionTurns += 1;
@@ -339,17 +463,64 @@ export class CodexAdapter implements AgentAdapter {
     // came out.
     this.bus.emit({ kind: 'prompt', agent: this.id, text, label });
 
-    await this.rpc.request('turn/start', {
+    await this.startTurn(text);
+
+    return this.turn.promise;
+  }
+
+  /**
+   * Codex's app-server takes one turn at a time — `turn/start` while a turn is
+   * running is refused, and there is no mid-turn input channel to push into.
+   *
+   * So the message is held and sent the moment the turn ends, which is the best
+   * this protocol allows and still beats the alternative: the exchange stays
+   * open until Codex has answered it, so the caller gets one result covering
+   * the original request and the amendment, exactly as it does for Claude.
+   * `queued` rather than `live` says which of the two you got.
+   */
+  async addMessage(text: string): Promise<InFlightDelivery | null> {
+    const body = text.trim();
+    if (!body) throw new Error('An added message needs some text.');
+    if (!this.rpc || !this.threadId) throw new Error('Codex adapter is not started.');
+
+    // Nothing in flight, so there is nothing to add this *to*. The caller sends
+    // it as a plain turn instead — which for an idle thread is all it ever was.
+    if (!this.turn) return null;
+
+    this.queuedAddOns.push(body);
+    return 'queued';
+  }
+
+  private async startTurn(text: string): Promise<void> {
+    await this.rpc!.request('turn/start', {
       threadId: this.threadId,
       input: [{ type: 'text', text, text_elements: [] }],
+      // No workspace roots here. `turn/start` takes a whole `sandboxPolicy`
+      // rather than a list of roots, and re-asserting one every turn would
+      // overwrite the thread's posture with a copy doet reconstructed. The
+      // roots belong to the worktree the thread was opened on, not to a turn.
       // Both are per-turn overrides in the app-server protocol, so the current
       // selection is re-asserted on every turn rather than only at thread start.
       ...(this.model ? { model: this.model } : {}),
       ...(this.effort ? { effort: this.effort } : {}),
       approvalPolicy: this.approvalPolicy,
     });
+  }
 
-    return this.turn.promise;
+  /** Opens the next leg of this exchange with a message that was waiting. */
+  private async deliverAddOn(body: string): Promise<void> {
+    const framed = addedMessagePrompt(body);
+    this.turnText = '';
+    this.transcript.push({ role: 'user', text: framed });
+    this.setStatus('thinking');
+    this.bus.emit({ kind: 'prompt', agent: this.id, text: body, label: 'added to this exchange' });
+    try {
+      await this.startTurn(framed);
+    } catch (error) {
+      // The exchange is still open and nothing else will close it, so this has
+      // to settle it rather than throw into a promise nobody is holding.
+      this.failTurn(error instanceof Error ? error.message : String(error));
+    }
   }
 
   history(): string {
@@ -358,6 +529,9 @@ export class CodexAdapter implements AgentAdapter {
 
   async interrupt(): Promise<void> {
     this.interruptedTurn = true;
+    // An added message that never got sent dies with the turn it was meant to
+    // amend; delivering it after an interrupt would restart work you stopped.
+    this.queuedAddOns.length = 0;
     for (const [id, deferred] of this.pending) {
       deferred.resolve({ decision: 'cancel' });
       this.pending.delete(id);
@@ -623,9 +797,26 @@ export class CodexAdapter implements AgentAdapter {
         break;
       }
 
-      case 'item/commandExecution/outputDelta':
+      case 'item/commandExecution/outputDelta': {
+        // This thread-item notification is already UTF-8 text. Never guess
+        // from its contents: ordinary output such as "YWJjZGVmZ2hp" is valid
+        // plain text and must not be silently decoded.
+        const chunk = typeof params.delta === 'string' ? params.delta : '';
+        if (chunk) {
+          this.bus.emit({
+            kind: 'output',
+            agent: this.id,
+            id: String(params.itemId ?? ''),
+            chunk,
+          });
+        }
+        break;
+      }
+
       case 'command/exec/outputDelta': {
-        const chunk = decodeChunk(params.chunk ?? params.delta);
+        // The standalone command channel names and documents this field as
+        // base64 in the app-server protocol; its encoding is structural.
+        const chunk = decodeBase64Chunk(params.deltaBase64);
         if (chunk) {
           this.bus.emit({
             kind: 'output',
@@ -681,36 +872,54 @@ export class CodexAdapter implements AgentAdapter {
 
   private finishTurn(turn?: { status?: string; error?: { message?: string } }): void {
     const raw = this.turnText;
-    const text = stripVerdict(raw).trim();
+    const text = raw.trim();
 
     this.transcript.push({ role: 'assistant', text });
     this.bus.emit({ kind: 'message', agent: this.id, text });
-    this.bus.emit({ kind: 'turn-end', agent: this.id, text });
-    this.setStatus('ready');
+
+    const error = turn?.status === 'failed' ? (turn.error?.message ?? 'The turn failed.') : undefined;
+
+    // A message was added while this turn ran. Codex could not take it then;
+    // it can now. The exchange is not over until it has been answered — an
+    // error or an interrupt ends it regardless, because the amendment was to
+    // work that just stopped.
+    if (!error && !this.interruptedTurn && this.queuedAddOns.length > 0) {
+      const next = this.queuedAddOns.shift()!;
+      if (text) this.turnLegs.push(text);
+      void this.deliverAddOn(next);
+      return;
+    }
+
+    this.settleTurn(text, error);
+  }
+
+  private failTurn(message: string): void {
+    if (!this.turn) return;
+    // No `turn-end` and no status change: an error event has already gone out,
+    // and a pane that prints "end of turn" under it reads like the turn worked.
+    this.settleTurn(this.turnText.trim(), message, { announce: false });
+  }
+
+  /** Ends the exchange, joining every leg the added messages produced. */
+  private settleTurn(last: string, error?: string, opts: { announce?: boolean } = {}): void {
+    this.queuedAddOns.length = 0;
+    const text = [...this.turnLegs, last].filter(Boolean).join('\n\n');
+    this.turnLegs = [];
+
+    if (opts.announce !== false) {
+      this.bus.emit({ kind: 'turn-end', agent: this.id, text });
+      this.setStatus('ready');
+    }
 
     const pending = this.turn;
     this.turn = null;
     pending?.resolve({
       agent: this.id,
       text,
-      verdict: parseVerdict(raw),
-      usage: this.usage,
-      interrupted: this.interruptedTurn,
-      error: turn?.status === 'failed' ? (turn.error?.message ?? 'The turn failed.') : undefined,
-    });
-  }
-
-  private failTurn(message: string): void {
-    const pending = this.turn;
-    if (!pending) return;
-    this.turn = null;
-    pending.resolve({
-      agent: this.id,
-      text: stripVerdict(this.turnText).trim(),
       verdict: null,
       usage: this.usage,
       interrupted: this.interruptedTurn,
-      error: message,
+      error,
     });
   }
 
@@ -862,20 +1071,8 @@ function renderPatch(params: Record<string, unknown>): string {
   );
 }
 
-/** Output deltas arrive as base64 or as plain text depending on the channel. */
-function decodeChunk(value: unknown): string {
-  if (typeof value === 'string') {
-    // Heuristic: app-server sends base64 for byte streams. Decode when it round-trips.
-    if (/^[A-Za-z0-9+/]+={0,2}$/.test(value) && value.length % 4 === 0 && value.length > 8) {
-      try {
-        const decoded = Buffer.from(value, 'base64').toString('utf8');
-        if (!decoded.includes('�')) return decoded;
-      } catch {
-        // Fall through to the raw string.
-      }
-    }
-    return value;
-  }
+function decodeBase64Chunk(value: unknown): string {
+  if (typeof value === 'string') return Buffer.from(value, 'base64').toString('utf8');
   if (Array.isArray(value)) return Buffer.from(value as number[]).toString('utf8');
   return '';
 }

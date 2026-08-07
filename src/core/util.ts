@@ -66,7 +66,28 @@ export function compactNumber(value: number | undefined): string {
 
 export function formatUsd(value: number | undefined): string {
   if (value == null) return '';
+  if (value === 0) return '$0.00';
   return value < 0.01 ? '<$0.01' : `$${value.toFixed(2)}`;
+}
+
+/**
+ * `4.2s`, `1m 07s`, `2h 03m` — an elapsed time that stays the same width as it
+ * grows, so a running counter does not make the row it sits in reflow.
+ *
+ * Sub-minute keeps a decimal because the difference between a 3-second and a
+ * 9-second turn is worth seeing; past a minute it stops pretending to that
+ * precision.
+ */
+export function formatDuration(ms: number | undefined): string {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return '–';
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+
+  const total = Math.round(seconds);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, '0')}m`;
+  return `${minutes}m ${String(total % 60).padStart(2, '0')}s`;
 }
 
 // ---------------------------------------------------------------------------
@@ -112,27 +133,87 @@ export function wrapLine(text: string, width: number): string[] {
   // Preserve leading indentation on continuation rows so wrapped code and
   // bullet lists stay readable.
   const indent = /^\s*/.exec(text)?.[0] ?? '';
-  const hanging = indent.length + 2 <= width ? indent : '';
+  const hanging = displayWidth(indent) + 2 <= width ? indent : '';
 
   let remaining = text;
   let prefix = '';
 
   while (remaining.length > 0) {
-    const room = width - prefix.length;
-    if (remaining.length <= room) {
+    const room = width - displayWidth(prefix);
+    if (displayWidth(remaining, displayWidth(prefix)) <= room) {
       rows.push(prefix + remaining);
       break;
     }
 
-    // Break on the last space that fits; fall back to a hard cut for words
-    // longer than the pane (paths, URLs, base64).
-    let cut = remaining.lastIndexOf(' ', room);
-    if (cut <= 0) cut = room;
+    // Break on the last whitespace grapheme that fits; fall back to a hard cut
+    // for long paths/URLs. Indexes come from Intl.Segmenter, so an emoji or a
+    // combining sequence is never split between rows.
+    let cut = fittingCut(remaining, room, displayWidth(prefix));
+    if (cut <= 0) cut = firstGraphemeEnd(remaining);
 
     rows.push(prefix + remaining.slice(0, cut).trimEnd());
-    remaining = remaining.slice(cut).replace(/^ +/, '');
+    remaining = remaining.slice(cut).replace(/^[ \t]+/, '');
     prefix = hanging;
   }
 
   return rows.length > 0 ? rows : [''];
+}
+
+const graphemes = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+/** Terminal-cell width, including wide CJK/emoji, combining marks and tabs. */
+export function displayWidth(text: string, startingColumn = 0): number {
+  let column = startingColumn;
+  for (const part of graphemes.segment(text)) {
+    column += graphemeWidth(part.segment, column);
+  }
+  return column - startingColumn;
+}
+
+function fittingCut(text: string, room: number, startingColumn: number): number {
+  let used = 0;
+  let end = 0;
+  let whitespace = 0;
+  for (const part of graphemes.segment(text)) {
+    const width = graphemeWidth(part.segment, startingColumn + used);
+    if (used + width > room) break;
+    used += width;
+    end = part.index + part.segment.length;
+    if (/^\s$/u.test(part.segment)) whitespace = part.index;
+  }
+  return whitespace > 0 ? whitespace : end;
+}
+
+function firstGraphemeEnd(text: string): number {
+  const first = graphemes.segment(text)[Symbol.iterator]().next().value as
+    | { segment: string }
+    | undefined;
+  return first?.segment.length ?? 1;
+}
+
+function graphemeWidth(value: string, column: number): number {
+  if (value === '\t') return 4 - (column % 4);
+  if (/^[\p{Mark}\u200d\ufe0e\ufe0f]+$/u.test(value)) return 0;
+  if (/\p{Extended_Pictographic}/u.test(value)) return 2;
+
+  const code = value.codePointAt(0) ?? 0;
+  return isWide(code) ? 2 : 1;
+}
+
+/** Unicode ranges conventionally rendered as two terminal cells. */
+function isWide(code: number): boolean {
+  return code >= 0x1100 && (
+    code <= 0x115f ||
+    code === 0x2329 ||
+    code === 0x232a ||
+    (code >= 0x2e80 && code <= 0xa4cf && code !== 0x303f) ||
+    (code >= 0xac00 && code <= 0xd7a3) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xfe10 && code <= 0xfe19) ||
+    (code >= 0xfe30 && code <= 0xfe6f) ||
+    (code >= 0xff00 && code <= 0xff60) ||
+    (code >= 0xffe0 && code <= 0xffe6) ||
+    (code >= 0x1b000 && code <= 0x1ffff) ||
+    (code >= 0x20000 && code <= 0x3fffd)
+  );
 }
