@@ -48,22 +48,29 @@ breaking early.
 Needs Node 20+, plus the `claude` and `codex` CLIs on `PATH` and already
 logged in.
 
-```bash
-npm install -g github:BeerJii/doet
-```
-
-That builds `master` and puts `doet` on your `PATH`. Updating is the same
-command again — there is no separate update step, and no version to pin.
-
-From a clone, to work on doet itself:
+Install from a clone kept somewhere other than where you work on doet, so the
+doet you use does not change under you while you are changing it:
 
 ```bash
-npm install
-npm run build
+git clone https://github.com/BeerJii/doet.git ~/.doet-src
+cd ~/.doet-src
+npm install       # builds on install, via prepare
 npm link          # puts `doet` on your PATH
 ```
 
-Or run it straight from source: `npm run dev`.
+To update, pull and rebuild:
+
+```bash
+cd ~/.doet-src && git pull && npm install
+```
+
+`npm i -g github:BeerJii/doet` does **not** work. npm runs `prepare` in a
+temporary clone that has no devDependencies, so there is no `tsc` to build
+with and the install fails on exit 127.
+
+To work on doet, clone it wherever you keep your work and run it from source
+with `npm run dev`. That reads `~/.doet-dev`, not the `~/.doet` your installed
+copy uses, so the two cannot disturb each other.
 
 ## Use
 

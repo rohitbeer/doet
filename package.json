@@ -15,7 +15,7 @@
   },
   "scripts": {
     "dev": "DOET_HOME=\"$HOME/.doet-dev\" tsx src/cli.tsx",
-    "build": "tsc",
+    "build": "tsc && chmod +x dist/cli.js",
     "start": "node dist/cli.js",
     "typecheck": "tsc --noEmit",
     "prepare": "npm run build"
