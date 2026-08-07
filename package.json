@@ -14,10 +14,11 @@
     "node": ">=20"
   },
   "scripts": {
-    "dev": "tsx src/cli.tsx",
+    "dev": "DOET_HOME=\"$HOME/.doet-dev\" tsx src/cli.tsx",
     "build": "tsc",
     "start": "node dist/cli.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepare": "npm run build"
   },
   "keywords": [
     "cli",

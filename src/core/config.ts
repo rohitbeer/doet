@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
+import { DOET_HOME } from './paths.js';
 import type { AgentId, AgentSessionSettings, Effort } from './types.js';
 import { DEFAULT_DEBATE, type DebateConfig } from './conductor.js';
 
@@ -82,7 +82,7 @@ export const DEFAULT_CONFIG: DoetConfig = {
   codex: { approvalPolicy: 'untrusted', sandbox: 'workspace-write' },
 };
 
-export const CONFIG_PATH = join(homedir(), '.doet', 'config.json');
+export const CONFIG_PATH = join(DOET_HOME, 'config.json');
 
 export function loadConfig(): DoetConfig {
   try {

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { render } from 'ink';
 import React from 'react';
 import { Bus } from './core/bus.js';
@@ -30,6 +31,23 @@ interface Args {
 
 function asEffort(value: string | undefined): Effort | undefined {
   return value && (EFFORTS as string[]).includes(value) ? (value as Effort) : undefined;
+}
+
+/**
+ * Read the number off package.json rather than hold a copy here, so an
+ * installed doet cannot report a version it isn't. The path resolves the same
+ * either way doet runs: `src/cli.tsx` under tsx and `dist/cli.js` once built
+ * both sit one directory below the manifest.
+ */
+function version(): string {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+      version?: string;
+    };
+    return pkg.version ?? 'unknown';
+  } catch {
+    return 'unknown';
+  }
 }
 
 function parseArgs(argv: string[]): Args {
@@ -95,6 +113,11 @@ function parseArgs(argv: string[]): Args {
         printHelp();
         process.exit(0);
         break;
+      case '-v':
+      case '--version':
+        process.stdout.write(`${version()}\n`);
+        process.exit(0);
+        break;
       default:
         break;
     }
@@ -126,6 +149,11 @@ Options
   -r, --resume [id]        Reopen a stored session (default: the most recent)
       --sessions           List stored sessions and exit
   -h, --help               This text
+  -v, --version            Print the version and exit
+
+Environment
+  DOET_HOME                Where doet keeps config and sessions
+                           (default: ~/.doet)
 
 In-session commands
   /open <agent>            Branch its session, or take it over here
