@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
@@ -188,6 +188,32 @@ export async function removeWorktree(root: string, path: string, force = false):
 
 export async function deleteBranch(root: string, branch: string, force = true): Promise<GitResult> {
   return git(root, ['branch', force ? '-D' : '-d', branch]);
+}
+
+/**
+ * Makes a path invisible to `git status` for this clone only.
+ *
+ * VS mode keeps its worktrees inside the repository, because a worktree the
+ * editor cannot see is a worktree nobody reviews. That would otherwise leave
+ * the main tree permanently dirty — and a dirty main tree is what `plug` and
+ * the next VS run both refuse to start on.
+ *
+ * `.git/info/exclude` rather than `.gitignore`: doet runs on other people's
+ * repositories and has no business editing a tracked file to make its own
+ * scratch space tidy. This one is local, untracked, and shared by every linked
+ * worktree, since it lives in the common git dir.
+ */
+export async function excludeLocally(gitCommonDir: string, pattern: string): Promise<void> {
+  const path = join(gitCommonDir, 'info', 'exclude');
+  try {
+    const existing = existsSync(path) ? readFileSync(path, 'utf8') : '';
+    if (existing.split('\n').some((line) => line.trim() === pattern)) return;
+    mkdirSync(dirname(path), { recursive: true });
+    appendFileSync(path, `${existing && !existing.endsWith('\n') ? '\n' : ''}${pattern}\n`, 'utf8');
+  } catch {
+    // Not being able to hide the directory is untidy, not fatal: the run still
+    // works, `git status` is just noisier than it should be.
+  }
 }
 
 // ---------------------------------------------------------------------------

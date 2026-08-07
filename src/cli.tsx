@@ -14,6 +14,7 @@ import { DOET_HOME } from './core/paths.js';
 import {
   addWorktree,
   deleteBranch,
+  excludeLocally,
   inspectRepo,
   removeWorktree,
   vsBranchName,
@@ -461,7 +462,18 @@ async function runVsMode(args: Args, config: ReturnType<typeof loadConfig>): Pro
   }
 
   const store = new SessionStore(randomUUID());
-  const worktreeBase = join(DOET_HOME, 'worktrees', store.id);
+
+  /*
+   * Worktrees live inside the repository, under an ignored `.doet/`.
+   *
+   * They used to sit in `DOET_HOME`, which put both agents' entire working
+   * copies somewhere the editor never opens — you could not see the code being
+   * written, let alone review it. Here your editor already has them, and the
+   * exclude below keeps `git status` clean so `plug` and the next run still see
+   * a clean main tree.
+   */
+  const worktreeBase = join(repo.root, '.doet', 'worktrees', store.id);
+  await excludeLocally(repo.gitCommonDir, '/.doet/');
   const worktrees: Partial<Record<SlotId, Awaited<ReturnType<typeof addWorktree>>>> = {};
 
   try {

@@ -48,6 +48,38 @@ interface PickSpec {
 
 const MAX_PANE_LINES = 4000;
 
+/** Never render a frame this short, whatever the overlays want. */
+const MIN_PANE_ROWS = 3;
+/** Header row plus the composer's three rows and its hint line. */
+const CHROME_ROWS = 5;
+
+/**
+ * How long the UI will wait on an agent CLI before taking its keyboard back.
+ *
+ * Interrupting a turn, releasing a session and disposing an adapter all cross
+ * a process boundary, and any of them can wedge. When one does, every key that
+ * waits on it — quit included — silently does nothing, and a single stuck
+ * promise reads as "the whole UI is frozen". So every such await is raced
+ * against a deadline: the operation may still be hung, but the screen and the
+ * keyboard are not.
+ */
+const AGENT_DEADLINE_MS = 6_000;
+
+async function withDeadline<T>(work: Promise<T>, ms = AGENT_DEADLINE_MS): Promise<T | null> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      work.catch(() => null),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export function VsApp({ buses, sides, runner, store, root }: Props) {
   const { exit, suspendTerminal } = useApp();
   const { stdout } = useStdout();
@@ -81,6 +113,8 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
   });
   const lineId = useRef(0);
   const takingOver = useRef(false);
+  /** Set by the first ctrl+c, so the second one can stop waiting and leave. */
+  const quitting = useRef(false);
 
   const refreshInfo = useCallback((slot: SlotId) => {
     setInfos((previous) => ({ ...previous, [slot]: sides[slot].adapter.info() }));
@@ -199,8 +233,27 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
     });
   }, [infos, query, root, sides, store]);
 
+  /**
+   * Says where each slot is working, in the pane, before anything runs.
+   *
+   * Two agents editing files you cannot find is worse than no isolation at all:
+   * the branch and the path are the only handles you have on their work, so
+   * they are the first thing each pane says.
+   */
+  useEffect(() => {
+    for (const slot of SLOT_IDS) {
+      push(slot, { kind: 'note', text: `── ${sides[slot].worktree.branch} ──` });
+      push(slot, { kind: 'note', text: sides[slot].worktree.path });
+    }
+  }, [push, sides]);
+
   const takeOver = useCallback(async (slot: SlotId) => {
-    if (takingOver.current) return;
+    if (takingOver.current) {
+      // Returning in silence is why a wedged handover reads as a dead keyboard:
+      // every further press does nothing and says nothing about why.
+      setNotice('Still handing a session over — press ctrl+c twice to force-quit doet.');
+      return;
+    }
     if (discarded[slot]) {
       setNotice(`Slot ${slot.toUpperCase()} was discarded; its saved Markdown remains in ${store.dir}.`);
       return;
@@ -218,11 +271,19 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
     let failure = '';
     try {
       if (running) {
-        await runner.abort(slot);
-        await runner.whenSlotIdle(slot);
+        setNotice(`Interrupting slot ${slot.toUpperCase()} before handing it over…`);
+        await withDeadline(runner.abort(slot));
+        await withDeadline(runner.whenSlotIdle(slot));
       }
-      sessionId = await adapter.releaseSession();
-      if (!sessionId) throw new Error('The CLI did not provide a resumable session id.');
+      // A deadline here does not mean "carry on anyway": if doet has not let go
+      // of the session, handing the same id to an interactive CLI would put two
+      // writers on it. Timing out aborts the handover instead.
+      sessionId = await withDeadline(adapter.releaseSession());
+      if (!sessionId) {
+        throw new Error(
+          `${adapter.info().label} did not release its session in time. It is still doet's — nothing was handed over.`,
+        );
+      }
       await suspendTerminal(async () => {
         process.stdout.write(`\nEntering slot ${slot.toUpperCase()} (${adapter.info().label}). Exit its CLI to return to doet.\n\n`);
         await new Promise<void>((resolve) => {
@@ -241,9 +302,14 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
       failure = error instanceof Error ? error.message : String(error);
     } finally {
       if (sessionId) {
-        await adapter.resumeSession(sessionId).catch((error: unknown) => {
-          failure ||= error instanceof Error ? error.message : String(error);
-        });
+        // Also on a deadline: a re-attach that never settles would leave the
+        // spinner spinning and `takingOver` latched, which is the same trap.
+        const resumed = await withDeadline(
+          adapter.resumeSession(sessionId).then(() => true),
+        );
+        if (!resumed) {
+          failure ||= `${adapter.info().label} did not re-attach to ${sessionId.slice(0, 8)}. Reopen it with its own CLI.`;
+        }
       }
       takingOver.current = false;
       setHandover(null);
@@ -462,13 +528,29 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
     }));
   }, []);
 
+  /**
+   * Quitting must work from any state, including one where an agent CLI has
+   * stopped answering. A tidy shutdown is attempted once, on a deadline; a
+   * second ctrl+c gives up on tidiness and leaves. Everything doet writes — the
+   * Markdown, the branches, the worktrees — is already on disk by then, so the
+   * only thing a hard exit costs is the adapters' own goodbye.
+   */
   const shutdown = useCallback(async () => {
+    if (quitting.current) {
+      process.stdout.write('[?25h\ndoet: forced quit. Branches and worktrees are intact.\n');
+      process.exit(0);
+    }
+    quitting.current = true;
+    setNotice('Stopping both slots… press ctrl+c again to force-quit.');
+
     if (runner.isRunning) {
-      await runner.abort();
-      await Promise.all(SLOT_IDS.map((slot) => runner.whenSlotIdle(slot)));
+      await withDeadline(runner.abort());
+      await withDeadline(Promise.all(SLOT_IDS.map((slot) => runner.whenSlotIdle(slot))));
     }
     store.detach();
-    await Promise.all(SLOT_IDS.map((slot) => sides[slot].adapter.dispose().catch(() => {})));
+    await withDeadline(
+      Promise.all(SLOT_IDS.map((slot) => sides[slot].adapter.dispose().catch(() => {}))),
+    );
     exit();
   }, [exit, runner, sides, store]);
 
@@ -580,11 +662,34 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
   });
 
   const widthA = Math.floor(cols / 2);
-  const pickHeight = pick ? Math.min(12, 5 + pick.items.length * 2) : 0;
-  const permissionHeight = currentPermission
-    ? Math.min(18, 8 + (currentPermission.request.detail?.split('\n').length ?? 0))
-    : 0;
-  const paneHeight = Math.max(8, rows - 7 - pickHeight - permissionHeight);
+
+  /*
+   * The frame must never be taller than the window.
+   *
+   * Ink can only redraw in place while the output fits: once a frame is taller
+   * than the terminal it is appended instead, and since the spinner re-renders
+   * eleven times a second the screen turns into a scrolling wall of half-frames
+   * with no way to read or click anything. The old `Math.max(8, rows - 7 - …)`
+   * guaranteed exactly that — an 18-row permission prompt in a 24-row window
+   * asked for 31 rows of frame — because the floor was applied last and could
+   * out-vote the window.
+   *
+   * So the window is the budget: overlays get what is left after a minimum
+   * pane, and the panes get what is left after the overlays.
+   */
+  const wanted = {
+    pick: pick ? Math.min(12, 5 + pick.items.length * 2) : 0,
+    permission: currentPermission
+      ? Math.min(18, 8 + (currentPermission.request.detail?.split('\n').length ?? 0))
+      : 0,
+  };
+  const overlayBudget = Math.max(0, rows - CHROME_ROWS - MIN_PANE_ROWS);
+  const permissionHeight = Math.min(wanted.permission, overlayBudget);
+  const pickHeight = Math.min(wanted.pick, overlayBudget - permissionHeight);
+  const paneHeight = Math.max(
+    MIN_PANE_ROWS,
+    rows - CHROME_ROWS - permissionHeight - pickHeight,
+  );
   const active = (slot: SlotId) => ['thinking', 'working', 'awaiting-permission'].includes(infos[slot].status);
   const phase = running ? 'exchanging' : finished ? 'done' : 'idle';
   const summary = useMemo(
@@ -596,13 +701,29 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
 
   return (
     <Box flexDirection="column" width={cols} height={rows}>
-      <Box paddingX={1}>
-        <Text bold>doet · vs</Text>
-        <Text dimColor> · same prompt, isolated branches</Text>
+      {/* One row, and it has to stay one row: a notice long enough to wrap
+          makes the header two rows tall, which pushes the frame past the
+          window and starts the append-forever scroll this layout exists to
+          prevent. Shrink and truncate rather than wrap. */}
+      <Box paddingX={1} width={cols} flexWrap="nowrap" overflow="hidden">
+        <Box flexShrink={0}>
+          <Text bold>doet · vs</Text>
+          <Text dimColor> · same prompt, isolated branches</Text>
+        </Box>
         <Box flexGrow={1} />
-        {handover && <Text color="cyan">{SPINNER[spinner % SPINNER.length]} handing over {handover.toUpperCase()} · </Text>}
-        <Text color={finished ? 'green' : running ? 'yellow' : 'white'}>{summary}</Text>
-        {notice && <Text dimColor wrap="truncate-end"> · {notice}</Text>}
+        {handover && (
+          <Box flexShrink={0}>
+            <Text color="cyan">{SPINNER[spinner % SPINNER.length]} handing over {handover.toUpperCase()} · </Text>
+          </Box>
+        )}
+        <Box flexShrink={0}>
+          <Text color={finished ? 'green' : running ? 'yellow' : 'white'}>{summary}</Text>
+        </Box>
+        {notice && (
+          <Box flexShrink={1} overflow="hidden">
+            <Text dimColor wrap="truncate-end"> · {notice}</Text>
+          </Box>
+        )}
       </Box>
       <Box>
         {SLOT_IDS.map((slot) => (
@@ -623,13 +744,16 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
           />
         ))}
       </Box>
-      {pick && (
-        <Box paddingX={1}>
+      {/* Both overlays are clamped to the rows the budget above set aside for
+          them. They render their natural height otherwise, and a tall one
+          would overflow the window on its own. */}
+      {pick && pickHeight > 0 && (
+        <Box paddingX={1} height={pickHeight} overflow="hidden">
           <Picker title={pick.title} items={pick.items} index={pickIndex} width={cols - 2} />
         </Box>
       )}
       {currentPermission && (
-        <Box paddingX={1}>
+        <Box paddingX={1} height={permissionHeight} overflow="hidden">
           <PermissionPrompt
             request={currentPermission.request}
             queued={permissions.length - 1}
