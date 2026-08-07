@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Bus } from '../bus.js';
-import { AGENT_LABELS, parseVerdict, stripVerdict } from '../relay.js';
+import { AGENT_LABELS } from '../relay.js';
 import {
   ALLOW_ONCE,
   ALLOW_SESSION,
@@ -9,6 +9,7 @@ import {
   type AgentInfo,
   type AgentStatus,
   type Effort,
+  type HandoffMode,
   type ModelChoice,
   type PermissionOption,
   type PermissionRequest,
@@ -37,6 +38,12 @@ const QUIET_ITEMS = new Set(['agentMessage', 'reasoning', 'userMessage', 'plan',
 export interface CodexAdapterOptions {
   bus: Bus;
   cwd: string;
+  /**
+   * Additional absolute paths the Codex sandbox may write. VS uses this for
+   * the repository's shared git metadata: a linked worktree cannot create
+   * commits or update its branch without it.
+   */
+  workspaceRoots?: string[];
   model: string;
   effort?: Effort;
   approvalPolicy?: string;
@@ -113,6 +120,16 @@ export class CodexAdapter implements AgentAdapter {
     this.effort = opts.effort;
     this.approvalPolicy = opts.approvalPolicy ?? 'untrusted';
     this.sandbox = opts.sandbox ?? 'workspace-write';
+  }
+
+  /**
+   * Supplying this field replaces Codex's inferred roots, so cwd must always
+   * be included alongside the extra roots. Omit it for ordinary co-code runs
+   * and preserve Codex's native defaults there.
+   */
+  private runtimeWorkspaceRoots(): string[] | undefined {
+    if (!this.opts.workspaceRoots?.length) return undefined;
+    return [...new Set([this.opts.cwd, ...this.opts.workspaceRoots])];
   }
 
   // -------------------------------------------------------------------------
@@ -203,6 +220,9 @@ export class CodexAdapter implements AgentAdapter {
     await this.rpc!.request('thread/resume', {
       threadId,
       cwd: this.opts.cwd,
+      ...(this.runtimeWorkspaceRoots()
+        ? { runtimeWorkspaceRoots: this.runtimeWorkspaceRoots() }
+        : {}),
       approvalPolicy: this.approvalPolicy,
       sandbox: this.sandbox,
       ...(this.model ? { model: this.model } : {}),
@@ -279,6 +299,9 @@ export class CodexAdapter implements AgentAdapter {
       ...(this.model ? { model: this.model } : {}),
       ...(this.opts.instructions ? { developerInstructions: this.opts.instructions } : {}),
       cwd: this.opts.cwd,
+      ...(this.runtimeWorkspaceRoots()
+        ? { runtimeWorkspaceRoots: this.runtimeWorkspaceRoots() }
+        : {}),
       approvalPolicy: this.approvalPolicy,
       sandbox: this.sandbox,
     });
@@ -287,6 +310,7 @@ export class CodexAdapter implements AgentAdapter {
 
     this.sessionSeq += 1;
     this.sessionTurns = 0;
+    this.usage = {};
     this.transcript = [];
   }
 
@@ -294,7 +318,7 @@ export class CodexAdapter implements AgentAdapter {
    * Retires this thread and opens a fresh one. Codex threads are server-side,
    * so this is a new `thread/start` rather than a process restart.
    */
-  async newSession(carry?: string): Promise<void> {
+  async newSession(carry?: string, carried: HandoffMode = carry ? 'full' : 'none'): Promise<void> {
     await this.openThread();
     this.carry = carry?.trim() ? carry.trim() : null;
     this.setStatus('ready');
@@ -302,8 +326,37 @@ export class CodexAdapter implements AgentAdapter {
       kind: 'session',
       agent: this.id,
       sessionId: this.threadId ?? undefined,
-      carried: carry ? 'full' : 'none',
+      carried,
     });
+  }
+
+  async setCwd(cwd: string): Promise<void> {
+    if (cwd === this.opts.cwd) return;
+    if (this.turn) throw new Error('Cannot move Codex while it is mid-turn.');
+
+    const threadId = this.threadId;
+    this.rpc?.stop();
+    this.rpc = null;
+    this.opts.cwd = cwd;
+    this.setStatus('starting');
+    await this.connect();
+    if (threadId) {
+      await this.rpc!.request('thread/resume', {
+        threadId,
+        cwd,
+        ...(this.runtimeWorkspaceRoots()
+          ? { runtimeWorkspaceRoots: this.runtimeWorkspaceRoots() }
+          : {}),
+        approvalPolicy: this.approvalPolicy,
+        sandbox: this.sandbox,
+        ...(this.model ? { model: this.model } : {}),
+        ...(this.opts.instructions ? { developerInstructions: this.opts.instructions } : {}),
+      });
+      this.threadId = threadId;
+    } else {
+      await this.openThread();
+    }
+    this.setStatus('ready');
   }
 
   async dispose(): Promise<void> {
@@ -342,6 +395,9 @@ export class CodexAdapter implements AgentAdapter {
     await this.rpc.request('turn/start', {
       threadId: this.threadId,
       input: [{ type: 'text', text, text_elements: [] }],
+      ...(this.runtimeWorkspaceRoots()
+        ? { runtimeWorkspaceRoots: this.runtimeWorkspaceRoots() }
+        : {}),
       // Both are per-turn overrides in the app-server protocol, so the current
       // selection is re-asserted on every turn rather than only at thread start.
       ...(this.model ? { model: this.model } : {}),
@@ -623,9 +679,26 @@ export class CodexAdapter implements AgentAdapter {
         break;
       }
 
-      case 'item/commandExecution/outputDelta':
+      case 'item/commandExecution/outputDelta': {
+        // This thread-item notification is already UTF-8 text. Never guess
+        // from its contents: ordinary output such as "YWJjZGVmZ2hp" is valid
+        // plain text and must not be silently decoded.
+        const chunk = typeof params.delta === 'string' ? params.delta : '';
+        if (chunk) {
+          this.bus.emit({
+            kind: 'output',
+            agent: this.id,
+            id: String(params.itemId ?? ''),
+            chunk,
+          });
+        }
+        break;
+      }
+
       case 'command/exec/outputDelta': {
-        const chunk = decodeChunk(params.chunk ?? params.delta);
+        // The standalone command channel names and documents this field as
+        // base64 in the app-server protocol; its encoding is structural.
+        const chunk = decodeBase64Chunk(params.deltaBase64);
         if (chunk) {
           this.bus.emit({
             kind: 'output',
@@ -681,7 +754,7 @@ export class CodexAdapter implements AgentAdapter {
 
   private finishTurn(turn?: { status?: string; error?: { message?: string } }): void {
     const raw = this.turnText;
-    const text = stripVerdict(raw).trim();
+    const text = raw.trim();
 
     this.transcript.push({ role: 'assistant', text });
     this.bus.emit({ kind: 'message', agent: this.id, text });
@@ -693,7 +766,7 @@ export class CodexAdapter implements AgentAdapter {
     pending?.resolve({
       agent: this.id,
       text,
-      verdict: parseVerdict(raw),
+      verdict: null,
       usage: this.usage,
       interrupted: this.interruptedTurn,
       error: turn?.status === 'failed' ? (turn.error?.message ?? 'The turn failed.') : undefined,
@@ -706,7 +779,7 @@ export class CodexAdapter implements AgentAdapter {
     this.turn = null;
     pending.resolve({
       agent: this.id,
-      text: stripVerdict(this.turnText).trim(),
+      text: this.turnText.trim(),
       verdict: null,
       usage: this.usage,
       interrupted: this.interruptedTurn,
@@ -862,20 +935,8 @@ function renderPatch(params: Record<string, unknown>): string {
   );
 }
 
-/** Output deltas arrive as base64 or as plain text depending on the channel. */
-function decodeChunk(value: unknown): string {
-  if (typeof value === 'string') {
-    // Heuristic: app-server sends base64 for byte streams. Decode when it round-trips.
-    if (/^[A-Za-z0-9+/]+={0,2}$/.test(value) && value.length % 4 === 0 && value.length > 8) {
-      try {
-        const decoded = Buffer.from(value, 'base64').toString('utf8');
-        if (!decoded.includes('�')) return decoded;
-      } catch {
-        // Fall through to the raw string.
-      }
-    }
-    return value;
-  }
+function decodeBase64Chunk(value: unknown): string {
+  if (typeof value === 'string') return Buffer.from(value, 'base64').toString('utf8');
   if (Array.isArray(value)) return Buffer.from(value as number[]).toString('utf8');
   return '';
 }

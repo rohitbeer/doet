@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { query, type Query, type PermissionResult, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { Bus } from '../bus.js';
-import { parseVerdict, stripVerdict, AGENT_LABELS } from '../relay.js';
+import { AGENT_LABELS } from '../relay.js';
 import {
   ALLOW_ONCE,
   ALLOW_SESSION,
@@ -10,6 +10,7 @@ import {
   type AgentInfo,
   type AgentStatus,
   type Effort,
+  type HandoffMode,
   type ModelChoice,
   type PermissionKind,
   type PermissionOption,
@@ -169,6 +170,7 @@ export class ClaudeAdapter implements AgentAdapter {
     } else {
       this.sessionId = undefined;
       this.sessionTurns = 0;
+      this.usage = {};
       this.transcript = [];
       this.sessionSeq += 1;
     }
@@ -256,7 +258,7 @@ export class ClaudeAdapter implements AgentAdapter {
    * prompt instead of being sent as a turn of its own — a handoff should not
    * cost an extra round-trip before the agent does any work.
    */
-  async newSession(carry?: string): Promise<void> {
+  async newSession(carry?: string, carried: HandoffMode = carry ? 'full' : 'none'): Promise<void> {
     await this.closeSession();
     this.openSession();
     this.carry = carry?.trim() ? carry.trim() : null;
@@ -264,8 +266,28 @@ export class ClaudeAdapter implements AgentAdapter {
     this.bus.emit({
       kind: 'session',
       agent: this.id,
-      carried: carry ? 'full' : 'none',
+      carried,
     });
+  }
+
+  async setCwd(cwd: string): Promise<void> {
+    if (cwd === this.opts.cwd) return;
+    if (this.turn) throw new Error('Cannot move Claude while it is mid-turn.');
+
+    const resume = this.sessionId;
+    await this.closeSession();
+    this.opts.cwd = cwd;
+    this.setStatus('starting');
+    this.openSession(resume);
+    if (resume) {
+      try {
+        await this.session?.initializationResult();
+      } catch {
+        // Older CLIs may not answer the handshake; the resumed session works.
+      }
+    }
+    if (this.effort) await this.applyEffort(this.effort);
+    this.setStatus('ready');
   }
 
   async dispose(): Promise<void> {
@@ -276,6 +298,22 @@ export class ClaudeAdapter implements AgentAdapter {
   private async closeSession(): Promise<void> {
     this.closed = true;
     this.inboxWaiter?.resolve();
+    // `return()` can end the SDK stream without a final `result` message. If
+    // a caller closes mid-turn (notably process shutdown), settle the public
+    // send() promise here so the adapter cannot remain permanently "mid-turn".
+    const activeTurn = this.turn;
+    if (activeTurn) {
+      this.turn = null;
+      this.interruptedTurn = true;
+      activeTurn.resolve({
+        agent: this.id,
+        text: this.turnText.trim(),
+        verdict: null,
+        usage: this.usage,
+        interrupted: true,
+        error: 'Claude session closed before the turn completed.',
+      });
+    }
     // Unblock anything still waiting on a permission answer, or the SDK's
     // stream will never drain.
     for (const [, deferred] of this.pending) {
@@ -548,13 +586,21 @@ export class ClaudeAdapter implements AgentAdapter {
     total_cost_usd?: number;
   }): void {
     const raw = message.subtype === 'success' && message.result ? message.result : this.turnText;
-    const text = stripVerdict(raw).trim();
+    const text = raw.trim();
 
+    const add = (previous: number | undefined, current: number | undefined): number | undefined =>
+      previous === undefined && current === undefined ? undefined : (previous ?? 0) + (current ?? 0);
     this.usage = {
-      inputTokens: message.usage?.input_tokens,
-      outputTokens: message.usage?.output_tokens,
-      cachedTokens: message.usage?.cache_read_input_tokens,
-      costUsd: message.total_cost_usd,
+      inputTokens: add(this.usage.inputTokens, message.usage?.input_tokens),
+      outputTokens: add(this.usage.outputTokens, message.usage?.output_tokens),
+      cachedTokens: add(this.usage.cachedTokens, message.usage?.cache_read_input_tokens),
+      totalTokens: add(
+        this.usage.totalTokens,
+        (message.usage?.input_tokens ?? 0) + (message.usage?.output_tokens ?? 0),
+      ),
+      // The SDK reports cost cumulatively for the session, unlike its per-turn
+      // token fields. Adding it would double-count every prior turn.
+      costUsd: message.total_cost_usd ?? this.usage.costUsd,
     };
     this.transcript.push({ role: 'assistant', text });
     this.bus.emit({ kind: 'usage', agent: this.id, usage: this.usage });
@@ -565,7 +611,7 @@ export class ClaudeAdapter implements AgentAdapter {
     const result: TurnResult = {
       agent: this.id,
       text,
-      verdict: parseVerdict(raw),
+      verdict: null,
       usage: this.usage,
       interrupted: this.interruptedTurn,
       error: message.is_error ? (message.result ?? 'The turn failed.') : undefined,

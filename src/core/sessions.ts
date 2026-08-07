@@ -12,7 +12,15 @@ import type { SummarySource } from './config.js';
 import { DOET_HOME } from './paths.js';
 import type { DebateResult } from './conductor.js';
 import { AGENT_LABELS } from './relay.js';
-import { AGENT_IDS, type AgentId, type DoetEvent, type Effort } from './types.js';
+import {
+  AGENT_IDS,
+  type AgentId,
+  type CliId,
+  type DoetEvent,
+  type Effort,
+  type SlotId,
+  type VsResult,
+} from './types.js';
 
 export const SESSIONS_DIR = join(DOET_HOME, 'sessions');
 
@@ -27,8 +35,19 @@ export interface SessionMeta {
   updatedAt: string;
   cwd: string;
   query: string;
+  /** Missing on sessions written before modes existed; read as co-code. */
+  mode?: 'co-code' | 'vs';
   agents: Record<AgentId, { sessionId?: string; model: string; effort?: Effort }>;
   summary: { agent: SummarySource; model: string };
+  base?: string;
+  slots?: Record<SlotId, {
+    cli: CliId;
+    sessionId?: string;
+    model: string;
+    effort?: Effort;
+    branch: string;
+    worktree: string;
+  }>;
 }
 
 /**
@@ -48,7 +67,7 @@ export class SessionStore {
   readonly dir: string;
   readonly id: string;
   private readonly startedAt = new Date();
-  private unsubscribe: (() => void) | null = null;
+  private readonly unsubscribers: Array<() => void> = [];
   private wroteHeader = false;
 
   /**
@@ -78,6 +97,37 @@ export class SessionStore {
             id: this.id,
             startedAt: this.startedAt.toISOString(),
             updatedAt: new Date().toISOString(),
+            mode: 'co-code',
+            ...meta,
+          } satisfies SessionMeta,
+          null,
+          2,
+        )}\n`,
+        'utf8',
+      ),
+    );
+  }
+
+  writeVsMeta(meta: {
+    cwd: string;
+    query: string;
+    base: string;
+    slots: NonNullable<SessionMeta['slots']>;
+  }): void {
+    this.safely(() =>
+      writeFileSync(
+        this.path('meta.json'),
+        `${JSON.stringify(
+          {
+            id: this.id,
+            startedAt: this.startedAt.toISOString(),
+            updatedAt: new Date().toISOString(),
+            mode: 'vs',
+            agents: {
+              claude: { model: '' },
+              codex: { model: '' },
+            },
+            summary: { agent: 'off', model: '' },
             ...meta,
           } satisfies SessionMeta,
           null,
@@ -122,7 +172,9 @@ export class SessionStore {
    */
   static resolve(idOrPrefix: string | true, cwd: string): SessionMeta | null {
     if (idOrPrefix === true) {
-      return SessionStore.list(cwd)[0] ?? SessionStore.list()[0] ?? null;
+      return SessionStore.list(cwd).find((meta) => meta.mode !== 'vs')
+        ?? SessionStore.list().find((meta) => meta.mode !== 'vs')
+        ?? null;
     }
     const exact = SessionStore.load(idOrPrefix);
     if (exact) return exact;
@@ -130,24 +182,32 @@ export class SessionStore {
   }
 
   attach(bus: Bus): void {
-    this.unsubscribe = bus.on((event) => this.record(event));
+    this.unsubscribers.push(bus.on((event) => this.record(event)));
+  }
+
+  /** Record one isolated VS bus while preserving which slot emitted it. */
+  attachVs(slot: SlotId, bus: Bus): void {
+    this.unsubscribers.push(bus.on((event) => this.record(event, slot)));
   }
 
   detach(): void {
-    this.unsubscribe?.();
-    this.unsubscribe = null;
+    for (const unsubscribe of this.unsubscribers.splice(0)) unsubscribe();
   }
 
   private path(name: string): string {
     return join(this.dir, name);
   }
 
-  private record(event: DoetEvent): void {
+  private record(event: DoetEvent, slot?: SlotId): void {
     // Token-level deltas would bloat the file by orders of magnitude and add
     // nothing the complete `message` event doesn't already carry.
     if (event.kind === 'text' || event.kind === 'thinking' || event.kind === 'output') return;
     this.safely(() =>
-      appendFileSync(this.path('events.jsonl'), `${JSON.stringify({ at: Date.now(), ...event })}\n`, 'utf8'),
+      appendFileSync(
+        this.path('events.jsonl'),
+        `${JSON.stringify({ at: Date.now(), ...(slot ? { slot } : {}), ...event })}\n`,
+        'utf8',
+      ),
     );
   }
 
@@ -168,6 +228,40 @@ export class SessionStore {
       }
       appendFileSync(this.path('session.md'), `\n## Request\n\n${query}\n`, 'utf8');
     });
+  }
+
+  openVsQuestion(query: string): void {
+    this.safely(() => {
+      if (!this.wroteHeader) {
+        writeFileSync(
+          this.path('session.md'),
+          `# doet vs session — ${this.startedAt.toLocaleString()}\n`,
+          'utf8',
+        );
+        this.wroteHeader = true;
+      }
+      appendFileSync(this.path('session.md'), `\n## Shared request\n\n${query}\n`, 'utf8');
+    });
+  }
+
+  appendVsTurn(slot: SlotId, label: string, text: string, error?: string): void {
+    this.safely(() =>
+      appendFileSync(
+        this.path('session.md'),
+        `\n## Slot ${slot.toUpperCase()} — ${label}\n\n${text || `_${error ?? 'No response.'}_`}\n`,
+        'utf8',
+      ),
+    );
+  }
+
+  appendVsFollowUp(slot: SlotId, prompt: string): void {
+    this.safely(() =>
+      appendFileSync(
+        this.path('session.md'),
+        `\n## Slot ${slot.toUpperCase()} — follow-up request\n\n${prompt}\n`,
+        'utf8',
+      ),
+    );
   }
 
   /** Marks where a resumed run picks the markdown back up. */
@@ -216,6 +310,17 @@ export class SessionStore {
     );
   }
 
+  writeSlotHistory(slot: SlotId, label: string, markdown: string): void {
+    if (!markdown.trim()) return;
+    this.safely(() =>
+      writeFileSync(
+        this.path(`${slot}.md`),
+        `# Slot ${slot.toUpperCase()} — ${label}\n\n${markdown}\n`,
+        'utf8',
+      ),
+    );
+  }
+
   /** The whole conversation so far, for a `full` handoff. */
   readSession(): string {
     return this.read('session.md');
@@ -239,6 +344,28 @@ export class SessionStore {
         `\n---\n\n## Final version — ${AGENT_LABELS[result.finalFrom]}\n\n` +
           `_${result.reason} after ${result.rounds} exchange${result.rounds === 1 ? '' : 's'}_\n\n` +
           `${result.final}\n`,
+        'utf8',
+      );
+    });
+    return path;
+  }
+
+  finalizeVs(result: VsResult): string {
+    const path = this.path('result.md');
+    this.safely(() => {
+      const sections = (['a', 'b'] as const).map((slot) => {
+        const side = result.slots[slot];
+        const summary = side.changed
+          ? `${side.files} files · +${side.insertions} −${side.deletions}`
+          : 'no committed changes';
+        return `## Slot ${slot.toUpperCase()} — ${AGENT_LABELS[side.cli]}\n\n` +
+          `- Branch: \`${side.branch}\`\n- Worktree: \`${side.worktree}\`\n` +
+          `- Result: ${summary}${side.error ? `\n- Error: ${side.error}` : ''}\n\n` +
+          `${side.diffstat ? `\`\`\`text\n${side.diffstat}\n\`\`\`\n` : ''}`;
+      });
+      writeFileSync(
+        path,
+        `# VS result\n\nBase: \`${result.base}\`\n\n${sections.join('\n\n')}\n`,
         'utf8',
       );
     });

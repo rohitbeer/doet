@@ -1,11 +1,15 @@
 # doet
 
-Two agent CLIs, one conversation.
+Two coding agents, two ways to work.
 
-doet is a **passer**, not an agent. It never calls a model itself and never
-writes a word of the answer. You ask a question, pick who answers first, and
-doet hands that agent's full response to the other one — back and forth, until
-they agree or run out of exchanges.
+doet has two modes:
+
+- **co-code** is the original passer: one agent answers, doet hands the full
+  response to the other, and they review each other for the number of exchanges
+  you choose.
+- **vs** sends the exact same task to two independent sessions in isolated git
+  worktrees. Each slot can use Claude or Codex, including the same CLI/model on
+  both sides, with its own model and effort setting.
 
 Both agents run in panes inside doet, and **every permission prompt from either
 agent surfaces in doet** with the same three keys. You approve a Codex shell
@@ -75,7 +79,9 @@ copy uses, so the two cannot disturb each other.
 ## Use
 
 ```bash
-doet                                  # in the directory you want the agents to work in
+doet                                  # pick co-code or vs at launch
+doet --mode co-code                   # the original relayed conversation
+doet --mode vs                        # two isolated implementations
 doet --rounds 8 --first codex
 doet -C ~/projects/api --claude-model opus --claude-effort high
 doet --summary codex --summary-model gpt-5.4-mini
@@ -85,21 +91,29 @@ doet --resume                         # reopen the latest session here
 doet --resume 2026-08-07T09-09-48     # or a specific one, by id or prefix
 ```
 
-Type a question, press enter, pick `[1]` Claude or `[2]` Codex to answer first.
-Then watch. While a debate runs, anything you type becomes a note delivered to
-the next agent before its turn.
+In co-code, type a question, press enter, then pick who answers first. While an
+exchange runs, anything you type becomes a note delivered before the next turn.
+
+In vs, choose the CLI, model and effort independently for slots A and B, then
+enter one task. Both sessions run concurrently on branches cut from the same
+clean HEAD. Select a result with `←` / `→`; `enter` opens that exact live agent
+session and returns to doet when you exit. Press `a` to open a terminal in its
+worktree, squash and commit its branch into the main tree, continue the same
+live session from doet's composer, or explicitly discard that branch/worktree.
+Plug-in commits keep the main tree clean, so the other result can be stacked
+afterwards. Follow-up turns are committed and appended to the session Markdown.
 
 | Key | |
 |---|---|
-| `enter` | send |
+| `enter` | send; with a pane selected, enter its live session |
 | `a` / `s` / `d` | answer a permission prompt |
 | `←` / `→` | select a pane — works while a turn is running; `tab` cycles |
-| `ctrl+o` | **open the selected pane's session** — branch it, or take it over |
+| `ctrl+o` | enter the selected pane's current live session |
 | `↑` / `↓` | scroll the selected pane — or walk command history when none is selected |
 | `pgup` / `pgdn` | page the selected pane |
 | `ctrl+e` | zoom the selected pane to full width |
 | `ctrl+g` | switch the bottom band between the relay log and the gist |
-| `esc` | release the pane, or end the debate after the current turn |
+| `esc` | release the pane, or end the co-code exchange after the current turn |
 | `ctrl+x` | abort the current turn now |
 | `ctrl+c` | quit |
 
@@ -107,7 +121,8 @@ the next agent before its turn.
 
 | | |
 |---|---|
-| `/open <agent>` | branch it, or take it over here — same as `ctrl+o` |
+| `/open <agent>` | enter its live session here — same as `ctrl+o` |
+| `/branch <agent>` | fork a co-code session into another terminal |
 | `/where` | where branched sessions should open |
 | `/model` | pick an agent, then a model, then an effort |
 | `/model <agent>` | jump straight to that agent's list |
@@ -119,7 +134,7 @@ the next agent before its turn.
 | `/session <agent> policy …` | `manual` · `rounds:N` · `tokens:N` |
 | `/session <agent> handoff …` | `ask` · `gist` · `full` · `none` |
 | `/perm <agent> <mode>` | permission posture — see below |
-| `/rounds <n>` | re-cap the debate |
+| `/rounds <n>` | re-cap the co-code exchange |
 | `/first <agent>` | default opener |
 | `/stop` | end after the current turn |
 | `/new` | fresh doet session, both agents rotated |
@@ -129,29 +144,32 @@ Everything you set this way persists to `~/.doet/config.json`.
 
 ## Opening a session in its own CLI
 
-Select a pane with `←` / `→` and press `ctrl+o`. There is no terminal hiding
+Select a pane with `←` / `→` and press `enter` or `ctrl+o`. There is no terminal hiding
 behind a pane to attach to — doet drives these CLIs over protocols, not a TTY
 (the Agent SDK for Claude, the app-server for Codex), which is what makes one
 normalized permission prompt possible in the first place. What the two sides do
 share is a session id.
 
-Neither CLI lets two processes write one session, so there are exactly two
-honest things doet can do, and `ctrl+o` asks which one you want:
+Neither CLI lets two processes write one session. doet therefore releases the
+session before starting the real interactive CLI, then resumes that same id
+when you exit. Work done there comes back into the pane. Forking is a distinct
+co-code action under `/branch`, so it never stands between pane selection and
+the current session.
 
-**Branch it into a new window** — nothing stops. The agent keeps working, doet
-keeps running, and a new window opens on a *copy* of the conversation. Use this
-to go poke at what an agent knows while the session carries on without you.
+**Branch it into a new window (`/branch`)** — nothing stops. The agent keeps
+working, doet keeps running, and a new window opens on a *copy* of the
+conversation. Use this to go poke at what an agent knows while the session
+carries on without you.
 
 ```
- ctrl+o ──► branch ──► new window: claude --resume <id> --fork-session
+ /branch ──► new window: claude --resume <id> --fork-session
                                    codex  resume <forked-id>
             doet's own session: never touched, never paused
 ```
 
-**Take it over here** — doet steps aside and gives you this terminal, on the
-*same* session. Everything you do comes back when you quit. This is the one
-that stops things: doet has to let go of the session, so if a turn is running
-it is interrupted and the session ends.
+**Take it over here (`enter`, `ctrl+o`, `/open`)** — doet steps aside and gives
+you this terminal, on the *same* session. Everything you do comes back when you
+quit. If a turn is running, that slot's turn is interrupted before handover.
 
 |  | branch | take over |
 |---|---|---|
@@ -351,9 +369,8 @@ instructions in front of an agent.
 
 That is removed, not made optional. It was briefly a config flag, which meant
 `~/.doet/config.json` files written before the change kept the old behaviour
-alive — the code said one thing and the machine did another. `loadConfig` now
-reads `debate` field by field for the same reason: a key for behaviour that no
-longer exists cannot bring it back.
+alive — the code said one thing and the machine did another. `loadConfig` reads
+the legacy `debate` key for compatibility but writes it back as `coCode`.
 
 The agents are also not asked to emit any status marker. doet used to have them
 end each turn with `<<<DOET:VERDICT AGREE|REVISE>>>` so it could detect
@@ -468,6 +485,12 @@ One directory per run, written as it happens rather than at the end:
   events.jsonl   every event, including permission decisions
 ```
 
+VS runs use that same sessions directory, with `a.md`, `b.md`, `result.md` and
+mode/slot/branch/worktree metadata in `meta.json`. Their checkouts live under
+`~/.doet/worktrees/<session>/`; worktrees and branches remain after exit unless
+you choose the confirmed **Discard artifacts** action, so they can still be
+tested without risking an accidental cleanup.
+
 Live, not write-once, because the markdown is not only a record — a `full`
 handoff reads `session.md` back to brief a replacement session, and a file that
 only appeared when a debate ended could not do that. `meta.json` is rewritten
@@ -479,7 +502,7 @@ needs to be resumable is the one that never reached a clean exit.
 and a branch build sharing `~/.doet/config.json` with an installed doet writes
 config keys back that only make sense on the branch.
 
-`--resume` reopens the same directory and keeps appending to it, and it prefers
+For co-code sessions, `--resume` reopens the same directory and keeps appending to it, and it prefers
 the models the session was actually using over whatever your config says now.
 If one of the stored agent sessions can no longer be opened, that agent starts
 fresh and says so rather than failing the whole resume.
@@ -502,6 +525,8 @@ npx tsx scripts/probe-resume.ts                # release a session and get it ba
 npx tsx scripts/probe-reopen.ts                # `doet --resume` end to end
 npx tsx scripts/probe-fork.ts [claude|codex]   # branch, and prove the live one is untouched
 npx tsx scripts/probe-takeover.ts [claude|codex|midturn]   # the full handover
+node --import tsx scripts/probe-git.ts                     # worktree/merge semantics
+node --import tsx scripts/probe-vs.ts                      # same prompt, two branches, Markdown
 script -q /dev/null npx tsx scripts/probe-suspend.tsx      # Ink hands over a real tty
 npx tsx scripts/probe-ui.tsx [debate|picker|gist|wrap|focus|takeover]   # one TUI frame
 ```
@@ -525,20 +550,17 @@ small queue rather than a bare `EventEmitter`.
 
 ## Limits
 
-- Two agents, fixed: Claude Code and Codex. The summary agent is one of the
-  same two, on its own session.
-- A pane is a view, not a terminal. `ctrl+o` either opens the real CLI in a new
-  window or hands you this one; it does not embed a terminal in the pane.
-- Taking a session over ends the current session rather than pausing it.
-  Branching is the option that leaves everything running, and the price is that
-  the branch is a copy — work done there does not flow back.
-- Branching needs tmux or macOS. Elsewhere only the takeover is offered.
-- Both agents share one working directory, and both can edit files in it. Two
-  agents editing the same file in the same round can clobber each other — doet
-  shows you every write, but does not lock anything.
+- There are two slots. In co-code they are Claude and Codex; in vs either slot
+  can independently be Claude or Codex.
+- A pane is a view, not a terminal. `enter`/`ctrl+o` hands this terminal to the
+  real CLI and re-attaches when it exits.
+- Taking a session over interrupts that slot's current turn, releases the
+  protocol owner, and re-attaches the same session when you exit its CLI.
+- In co-code both agents share one working directory and can edit the same
+  files. VS mode is the isolated alternative: one worktree and branch per slot.
 - `--resume` reopens agent sessions, not doet's own screen: the panes come back
   empty, with the gist restored and the transcript on disk. Both agents still
   remember everything.
-- A `full` handoff sends the whole session as one message. On a long debate
+- A `full` handoff sends the whole session as one message. On a long co-code run
   that is a large prompt, and doet does not check it against the model's
   context window first.

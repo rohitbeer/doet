@@ -334,7 +334,7 @@ export class Conductor {
   /** Rotates `agent` now, whatever its policy says. Used by `/session … new`. */
   async rotate(agent: AgentId, mode: HandoffMode): Promise<void> {
     const carry = this.buildHandoff(agent, mode);
-    await this.agents[agent].newSession(carry);
+    await this.agents[agent].newSession(carry, mode);
     this.store.appendNote(
       `New ${agent} session opened, carrying ${mode === 'none' ? 'nothing' : mode}.`,
     );

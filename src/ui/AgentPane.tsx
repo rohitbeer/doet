@@ -1,9 +1,8 @@
-import React, { useMemo } from 'react';
+import React, { useEffect, useMemo } from 'react';
 import { Box, Text } from 'ink';
 import type { AgentId, AgentInfo } from '../core/types.js';
 import { AGENT_COLOR, SPINNER, STATUS_COLOR, STATUS_LABEL } from './theme.js';
 import { compactNumber, wrapLine } from '../core/util.js';
-import { isVerdictLine } from '../core/relay.js';
 import { Markdown, parseInline, wrapSpans, type Span } from './markdown.js';
 
 export type LineKind =
@@ -81,7 +80,9 @@ export function AgentPane({
   const end = rows.length - offset;
   const visible = rows.slice(Math.max(0, end - viewport), end);
 
-  onRows?.(rows.length, viewport);
+  useEffect(() => {
+    onRows?.(rows.length, viewport);
+  }, [onRows, rows.length, viewport]);
 
   const following = offset === 0;
 
@@ -102,7 +103,7 @@ export function AgentPane({
         {info.effort && <Text dimColor>/{info.effort}</Text>}
         {info.sessionSeq > 1 && <Text dimColor> #{info.sessionSeq}</Text>}
         <Box flexGrow={1} />
-        {focused && <Text color="white">ctrl+o open </Text>}
+        {focused && <Text color="white">enter open </Text>}
         {!following && (
           <Text color="yellow">
             ↑{offset}{' '}
@@ -128,10 +129,6 @@ export function AgentPane({
 function layout(lines: PaneLine[], width: number): Row[] {
   const rows: Row[] = [];
   for (const line of lines) {
-    // doet's own control marker, which the agent was asked to emit and which
-    // is stripped everywhere else. The pane renders raw token deltas, so it has
-    // to drop the line itself rather than rely on the cleaned message.
-    if (line.kind === 'text' && isVerdictLine(line.text)) continue;
     // Prompt bodies get a gutter, so they wrap two columns narrower.
     const isPrompt = line.kind === 'prompt';
     const room = isPrompt ? Math.max(4, width - 2) : width;

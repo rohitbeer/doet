@@ -8,8 +8,11 @@
  */
 
 export type AgentId = 'claude' | 'codex';
+export type CliId = AgentId;
+export type SlotId = 'a' | 'b';
 
 export const AGENT_IDS: AgentId[] = ['claude', 'codex'];
+export const SLOT_IDS: SlotId[] = ['a', 'b'];
 
 export function otherAgent(id: AgentId): AgentId {
   return id === 'claude' ? 'codex' : 'claude';
@@ -249,6 +252,29 @@ export interface TurnResult {
   error?: string;
 }
 
+export interface VsSlotResult {
+  slot: SlotId;
+  cli: CliId;
+  branch: string;
+  worktree: string;
+  commit: string;
+  changed: boolean;
+  files: number;
+  insertions: number;
+  deletions: number;
+  diffstat: string;
+  commits: string[];
+  response: string;
+  usage: Usage;
+  error?: string;
+}
+
+export interface VsResult {
+  query: string;
+  base: string;
+  slots: Record<SlotId, VsSlotResult>;
+}
+
 export interface AgentAdapter {
   readonly id: AgentId;
   readonly label: string;
@@ -268,12 +294,14 @@ export interface AgentAdapter {
   listModels(): Promise<ModelChoice[]>;
   setPermissionMode(mode: string): Promise<void>;
   listPermissionModes(): string[];
+  /** Move subsequent opens/resumes to another working tree. Never changes it mid-turn. */
+  setCwd(cwd: string): Promise<void>;
   /**
    * Retire the current session and open a fresh one. `carry` is prepended to
    * the next prompt rather than sent as a turn of its own, so a handoff costs
    * no extra round-trip.
    */
-  newSession(carry?: string): Promise<void>;
+  newSession(carry?: string, carried?: HandoffMode): Promise<void>;
   /**
    * Drop the live session so something else can own it, returning the id needed
    * to get it back. Null when there is no resumable session yet.

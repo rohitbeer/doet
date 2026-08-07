@@ -54,7 +54,7 @@ interface Props {
 const HINT_IDLE = 'enter send · ←→ select a pane · ctrl+g gist · /help commands · ctrl+c quit';
 const HINT_RUNNING = 'type to interject · ←→ select a pane · esc stop after turn · ctrl+x abort now';
 const HINT_FOCUSED =
-  'ctrl+o open this session · ↑↓ scroll · pgup/pgdn page · ctrl+e zoom · esc release';
+  'enter/ctrl+o enter live session · ↑↓ scroll · pgup/pgdn page · ctrl+e zoom · esc release';
 
 /** A picker waiting on the user. `onPick` may open the next one in a chain. */
 interface PickSpec {
@@ -783,58 +783,12 @@ export function App({
     [config, openPicker, closePicker, branchWith],
   );
 
-  /**
-   * Neither CLI lets two processes write one session, so there are exactly two
-   * honest choices and this asks which one you want.
-   */
+  /** Pane selection enters the live session directly; branching is `/branch`. */
   const requestTakeOver = useCallback(
     (agent: AgentId) => {
-      if (takingOver.current) {
-        setNotice('Already handing a session over — finish that one first.');
-        return;
-      }
-
-      // Where a branch goes is a setting, asked once — so this only has to ask
-      // the question that genuinely differs each time.
-      const where =
-        config.branch.mode === 'copy'
-          ? 'you get the command'
-          : (launcherById(
-              config.branch.mode === 'command' ? 'command' : (config.branch.launcher ?? ''),
-              config.branch.command,
-            )?.label ?? 'a new terminal');
-
-      openPicker({
-        title: `${AGENT_LABELS[agent]}${conductor.isRunning ? ' is mid-turn' : ''} — open its session how?`,
-        hint: 'a branch leaves everything running · a takeover brings the work back',
-        items: [
-          {
-            id: 'branch',
-            label: config.branch.mode === 'ask' ? 'Branch it' : `Branch it — ${where}`,
-            description:
-              'Nothing here stops: the agent keeps working and doet keeps running. You get a copy of the conversation, and what you do with it stays there.',
-          },
-          {
-            id: 'takeover',
-            label: 'Take this session over here',
-            description: conductor.isRunning
-              ? 'doet steps aside and gives you this terminal. The current turn is interrupted and the session ends, but everything you do comes back.'
-              : 'doet steps aside and gives you this terminal. Everything you do comes back into the session.',
-          },
-          { id: 'cancel', label: 'Cancel', description: 'Carry on as you were.' },
-        ],
-        onPick: (choice) => {
-          closePicker();
-          if (choice === 'takeover') {
-            void takeOver(agent);
-          } else if (choice === 'branch') {
-            if (config.branch.mode === 'ask') askWhereBranchesOpen(agent);
-            else branchWith(agent, config.branch);
-          }
-        },
-      });
+      void takeOver(agent);
     },
-    [conductor, config, takeOver, branchWith, askWhereBranchesOpen, openPicker, closePicker],
+    [takeOver],
   );
 
   // ---------------------------------------------------------------------
@@ -844,7 +798,7 @@ export function App({
   /** Asked after "who answers first", once per question. */
   const askRounds = useCallback(
     (query: string, first: AgentId) => {
-      const last = config.debate.maxRounds;
+      const last = config.coCode.maxRounds;
       const choices = [2, 4, 6, 8, 12];
       openPicker({
         title: `How many exchanges? — ${AGENT_LABELS[first]} answers first`,
@@ -872,7 +826,7 @@ export function App({
           const rounds = Number(value);
           // Remembered as the default the next question is offered, not as a
           // setting you have to go and change.
-          config.debate.maxRounds = rounds;
+          config.coCode.maxRounds = rounds;
           saveConfig(config);
           startDebate(query, first, rounds);
         },
@@ -905,7 +859,7 @@ export function App({
     switch (command) {
       case 'help':
         setNotice(
-          '/open <agent> · /where · /model [agent] · /summary · /session <agent> <new|policy …|handoff …> · /gist · /rounds <n> · /first <agent> · /perm <agent> <mode> · /stop · /new · /quit',
+          '/open <agent> · /branch <agent> · /where · /model [agent] · /summary · /session <agent> <new|policy …|handoff …> · /gist · /rounds <n> · /first <agent> · /perm <agent> <mode> · /stop · /new · /quit',
         );
         break;
 
@@ -948,6 +902,10 @@ export function App({
           break;
         }
         void agents[agent].listModels().then((list) => {
+          if (list.length === 0) {
+            setNotice(`${AGENT_LABELS[agent]} did not report a model list. Use /model ${agent} <id>.`);
+            return;
+          }
           openPicker({
             title: `${AGENT_LABELS[agent]} models`,
             hint: '↑↓ move · enter select · esc close',
@@ -984,6 +942,17 @@ export function App({
         break;
       }
 
+      case 'branch': {
+        const agent = args[0] ?? focus ?? active ?? undefined;
+        if (!isAgent(agent)) {
+          setNotice('Usage: /branch <claude|codex>');
+          break;
+        }
+        if (config.branch.mode === 'ask') askWhereBranchesOpen(agent);
+        else branchWith(agent, config.branch);
+        break;
+      }
+
       case 'gist':
         bandPinned.current = true;
         setBand('gist');
@@ -1007,6 +976,10 @@ export function App({
         }
 
         if (action === 'new') {
+          if (conductor.isRunning) {
+            setNotice('Stop the current exchange before replacing an agent session.');
+            break;
+          }
           void (async () => {
             const mode = await askHandoff(AGENT_LABELS[agent], 'you asked for one');
             await conductor.rotate(agent, mode);
@@ -1016,7 +989,8 @@ export function App({
         }
 
         if (action === 'policy') {
-          const policy = parseSessionPolicy(rest.join(''));
+          const policyText = rest.join(' ').trim().replace(/\s*:\s*|\s+/g, ':');
+          const policy = parseSessionPolicy(policyText);
           if (!policy) {
             setNotice('Usage: /session <agent> policy <manual|rounds:N|tokens:N>');
             break;
@@ -1071,7 +1045,7 @@ export function App({
           break;
         }
         conductor.configure({ maxRounds: n });
-        config.debate.maxRounds = n;
+        config.coCode.maxRounds = n;
         saveConfig(config);
         setNotice(`${n} exchanges will be offered by default — you still pick per question.`);
         break;
@@ -1097,12 +1071,18 @@ export function App({
         // A fresh doet session is a fresh session for both agents too — the
         // panes clearing while the agents still remember everything is exactly
         // the confusion this used to cause.
+        if (conductor.isRunning) {
+          setNotice('Stop the current exchange before starting a new co-code session.');
+          break;
+        }
         void (async () => {
           const mode = await askHandoff('doet', 'both agents start over');
           for (const id of AGENT_IDS) {
             await conductor.rotate(id, mode);
             refreshInfo(id);
           }
+          await summarizer.reset();
+          store.writeGist('');
           conductor.clear();
           setPanes({ claude: [], codex: [] });
           setRelay([]);
@@ -1128,6 +1108,10 @@ export function App({
   };
 
   const shutdown = async () => {
+    if (conductor.isRunning) {
+      await conductor.abort();
+      await conductor.whenIdle();
+    }
     store.snapshot({ claude: agents.claude.history(), codex: agents.codex.history() });
     store.detach();
     await summarizer.dispose().catch(() => {});
@@ -1297,6 +1281,10 @@ export function App({
     }
 
     if (key.return) {
+      if (focus) {
+        requestTakeOver(focus);
+        return;
+      }
       const text = input.trim();
       if (!text) return;
       setInput('');
@@ -1365,7 +1353,7 @@ export function App({
           status jammed onto the model name) rather than as an overflow. */}
       <Box paddingX={1} width={cols} flexWrap="nowrap" overflow="hidden">
         <Box flexShrink={0}>
-          <Text bold>doet</Text>
+          <Text bold>doet · co-code</Text>
           <Text dimColor> · </Text>
           <Text color={AGENT_COLOR.claude}>claude</Text>
           <Text dimColor>/</Text>

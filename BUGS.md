@@ -1,7 +1,8 @@
 # doet — bug report
 
-Audit of `doet` (v0.1.0, ~2.9k LOC of `src/`) performed 2026-08-07. **Nothing was fixed**; this
-file only records what was found.
+Audit of `doet` (v0.1.0, ~2.9k LOC of `src/`) performed 2026-08-07. This file records the
+original findings. The current implementation fixes #1–#18 and #20–#21; their sections remain as
+regression context. #19, the streaming-layout performance issue, remains open.
 
 Baseline facts, so the list below is read in context:
 
