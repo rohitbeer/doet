@@ -1,9 +1,12 @@
 import { spawn } from 'node:child_process';
+import { mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Text, useApp, useInput, useStdout } from 'ink';
 import type { Bus } from '../core/bus.js';
 import {
   abortMerge,
+  addWorktree,
   commitAll,
   deleteBranch,
   inspectRepo,
@@ -11,7 +14,7 @@ import {
   removeWorktree,
 } from '../core/git.js';
 import type { SessionStore } from '../core/sessions.js';
-import { detectLauncher } from '../core/terminal.js';
+import { detectLauncher, shellCommand } from '../core/terminal.js';
 import {
   SLOT_IDS,
   type AgentAdapter,
@@ -115,6 +118,10 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
   const takingOver = useRef(false);
   /** Set by the first ctrl+c, so the second one can stop waiting and leave. */
   const quitting = useRef(false);
+  /** Set by `esc` while a handover is waiting on a turn to finish. */
+  const cancelHandover = useRef(false);
+  /** Keeps forked branch and worktree names unique per slot. */
+  const forkCount = useRef<Record<SlotId, number>>({ a: 0, b: 0 });
 
   const refreshInfo = useCallback((slot: SlotId) => {
     setInfos((previous) => ({ ...previous, [slot]: sides[slot].adapter.info() }));
@@ -143,6 +150,20 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
 
   useEffect(() => {
     const onResize = () => {
+      /*
+       * Wipe the screen before re-rendering at the new size.
+       *
+       * Ink erases the previous frame by counting rows, and a resize makes that
+       * count a lie: the terminal has already reflowed those rows to a new
+       * width, so the erase removes the wrong ones and the leftovers stay on
+       * screen — which is why a stretched window ends up showing one frame
+       * threaded through another ("isolated branchesbranches ready"). Once that
+       * has happened the corruption is permanent, because every later frame is
+       * erased against the same wrong count. Clearing the screen *and* the
+       * scrollback costs one flicker and makes the next frame the only thing
+       * there is.
+       */
+      stdout.write('\u001B[2J\u001B[3J\u001B[H');
       setCols(stdout.columns ?? 100);
       setRows(stdout.rows ?? 30);
     };
@@ -247,7 +268,18 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
     }
   }, [push, sides]);
 
-  const takeOver = useCallback(async (slot: SlotId) => {
+  /**
+   * Hands one slot's live session to you, in its own CLI.
+   *
+   * A turn in flight is *waited on*, not cut short. Entering the session is how
+   * you take the work further, and a turn interrupted halfway leaves the thing
+   * you were entering half-done — the agent stops mid-edit, its branch holds
+   * whatever it had written by then, and continuing means first working out
+   * what it was in the middle of. Interrupting is still available, from the
+   * actions menu, for when the agent is off down the wrong path and stopping it
+   * is the point.
+   */
+  const takeOver = useCallback(async (slot: SlotId, opts: { interrupt?: boolean } = {}) => {
     if (takingOver.current) {
       // Returning in silence is why a wedged handover reads as a dead keyboard:
       // every further press does nothing and says nothing about why.
@@ -266,14 +298,32 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
     }
 
     takingOver.current = true;
+    cancelHandover.current = false;
     setHandover(slot);
     let sessionId: string | null = null;
     let failure = '';
+    let cancelled = false;
     try {
       if (running) {
-        setNotice(`Interrupting slot ${slot.toUpperCase()} before handing it over…`);
-        await withDeadline(runner.abort(slot));
-        await withDeadline(runner.whenSlotIdle(slot));
+        if (opts.interrupt) {
+          setNotice(`Interrupting slot ${slot.toUpperCase()} before handing it over…`);
+          await withDeadline(runner.abort(slot));
+          await withDeadline(runner.whenSlotIdle(slot));
+        } else {
+          // No deadline on this one: the wait is the feature, and how long a
+          // turn takes is the agent's business. `esc` is the way out, and the
+          // rest of the UI keeps running while this sits here.
+          setNotice(
+            `Slot ${slot.toUpperCase()} is mid-turn — handing over the moment it finishes · esc cancels · a → interrupt now`,
+          );
+          await runner.whenSlotIdle(slot);
+        }
+      }
+
+      if (cancelHandover.current) {
+        cancelled = true;
+        setNotice(`Handover cancelled. Slot ${slot.toUpperCase()} carries on in doet.`);
+        return;
       }
       // A deadline here does not mean "carry on anyway": if doet has not let go
       // of the session, handing the same id to an interactive CLI would put two
@@ -315,6 +365,8 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
       setHandover(null);
       refreshInfo(slot);
     }
+    // A cancelled handover never left doet, so it has nothing to report.
+    if (cancelled) return;
     push(slot, {
       kind: failure ? 'error' : 'note',
       text: failure ? `handover ended: ${failure}` : '── live session returned to doet ──',
@@ -430,14 +482,82 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
     setPickIndex(1);
   }, [discardSlot]);
 
+  /**
+   * Branches a slot's session into a checkout of its own.
+   *
+   * The co-code fork opens a copy of the conversation and leaves the original
+   * running. Here that is only half of it: a forked *session* pointed at the
+   * slot's own worktree would be a second writer in one directory, undoing the
+   * isolation the whole mode is built on. So the fork gets its own worktree and
+   * its own branch, cut from where the slot has got to — commits included,
+   * which is why the slot is committed first.
+   */
+  const forkOut = useCallback(async (slot: SlotId) => {
+    const side = sides[slot];
+    try {
+      setNotice(`Branching slot ${slot.toUpperCase()}…`);
+      // Otherwise the fork starts from the slot's last commit and silently
+      // loses everything it has written since.
+      await commitAll(side.worktree.path, `doet vs: slot ${slot} before fork`);
+
+      const argv = await side.adapter.forkSession();
+      if (!argv) {
+        setNotice(`Slot ${slot.toUpperCase()} has no session to branch yet.`);
+        return;
+      }
+
+      const seq = (forkCount.current[slot] += 1);
+      const branch = `${side.worktree.branch}-fork${seq}`;
+      const path = join(dirname(side.worktree.path), `${slot}-fork${seq}`);
+      mkdirSync(dirname(path), { recursive: true });
+      await addWorktree(root, path, branch, side.worktree.branch);
+
+      const launcher = detectLauncher();
+      if (!launcher) {
+        push(slot, { kind: 'note', text: `── fork ready · ${branch} ──` });
+        push(slot, { kind: 'note', text: shellCommand(argv.command, argv.args, path) });
+        setNotice('No terminal doet can open here — the fork command is in the pane.');
+        return;
+      }
+
+      await launcher.launch(argv.command, argv.args, path);
+      push(slot, { kind: 'note', text: `── forked into ${branch} ──` });
+      push(slot, { kind: 'note', text: path });
+      setNotice(`Slot ${slot.toUpperCase()} forked into ${launcher.label}; this session carries on.`);
+    } catch (error) {
+      setNotice(
+        `Could not fork slot ${slot.toUpperCase()}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }, [push, root, sides]);
+
   const openActions = useCallback((slot: SlotId) => {
     if (discarded[slot]) {
       setNotice(`Slot ${slot.toUpperCase()} was discarded; only its saved Markdown remains.`);
       return;
     }
     const items: PickerItem[] = [
-      { id: 'enter', label: 'Enter live session', description: 'Exit the agent CLI to return to this VS screen.' },
+      {
+        id: 'enter',
+        label: running ? 'Enter live session when this turn finishes' : 'Enter live session',
+        description: running
+          ? 'doet waits for the turn, then gives you this terminal. Nothing is cut short. Exit the CLI to come back.'
+          : 'Exit the agent CLI to return to this VS screen.',
+      },
+      {
+        id: 'fork',
+        label: 'Fork into a new worktree',
+        description:
+          'Branches the session and gives the branch its own checkout, so you can test it without touching what this slot is doing. Nothing here stops.',
+      },
     ];
+    if (running) {
+      items.push({
+        id: 'interrupt',
+        label: 'Interrupt, then enter',
+        description: 'Stops the turn where it is. Use it when the agent is going the wrong way.',
+      });
+    }
     if (finished) {
       items.push(
         { id: 'test', label: 'Open worktree terminal', description: sides[slot].worktree.path },
@@ -454,6 +574,8 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
       onPick: (choice) => {
         setPick(null);
         if (choice === 'enter') void takeOver(slot);
+        else if (choice === 'interrupt') void takeOver(slot, { interrupt: true });
+        else if (choice === 'fork') void forkOut(slot);
         else if (choice === 'test') void openWorktree(slot);
         else if (choice === 'plug') void plug(slot);
         else if (choice === 'continue') {
@@ -468,7 +590,7 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
       },
     });
     setPickIndex(0);
-  }, [confirmDiscard, discarded, finished, mergeConflict, openWorktree, plug, plugged, root, sides, takeOver]);
+  }, [confirmDiscard, discarded, finished, forkOut, mergeConflict, openWorktree, plug, plugged, root, running, sides, takeOver]);
 
   const start = useCallback((query: string) => {
     setQuery(query);
@@ -537,7 +659,7 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
    */
   const shutdown = useCallback(async () => {
     if (quitting.current) {
-      process.stdout.write('[?25h\ndoet: forced quit. Branches and worktrees are intact.\n');
+      process.stdout.write('\u001B[?25h\ndoet: forced quit. Branches and worktrees are intact.\n');
       process.exit(0);
     }
     quitting.current = true;
@@ -618,6 +740,13 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
       return;
     }
     if (key.escape) {
+      // A handover waiting on a turn is the thing esc should call off first —
+      // it is the only state where doet is waiting on your behalf.
+      if (handover && !cancelHandover.current) {
+        cancelHandover.current = true;
+        setNotice('Cancelling the handover once this turn finishes…');
+        return;
+      }
       if (focus) setFocus(null);
       else if (running) void runner.abort();
       return;
@@ -642,12 +771,14 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
           setNotice('Resolve the current merge conflicts, or select a pane, press a, and choose Abort conflicted merge.');
           return;
         }
-        if (!continuedSlot) {
-          setNotice('Select a finished slot, press a, and plug it into main before sending follow-ups.');
-          return;
-        }
         setInput('');
-        continueRun(continuedSlot, query);
+        // Plugging one side into main is one way a VS pair carries on, not the
+        // only way. Before that happens both slots are still live sessions on
+        // their own branches, and the obvious thing to do with a result you are
+        // not happy with — say so and let them both go again — used to be
+        // refused with a notice about plugging in, which read as a dead prompt.
+        if (continuedSlot) continueRun(continuedSlot, query);
+        else start(query);
         return;
       }
       setInput('');
@@ -767,15 +898,19 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
         phase={phase}
         active={running ? sides[runningSlot ?? 'a'].cli : null}
         width={cols}
-        hint={focus
-          ? 'enter/ctrl+o live session · a actions · esc release'
-          : running
-            ? '←→ select a slot · ctrl+x stop both'
-            : finished
-              ? continuedSlot
-                ? `continuing ${continuedSlot.toUpperCase()} in main · type follow-up · ←→ select`
-                : '←→ select · a test/plug/discard actions'
-              : 'type one request · enter sends it to both slots'}
+        hint={handover
+          ? 'waiting for the turn to finish · esc cancels the handover'
+          : focus
+            ? running
+              ? 'enter live session after this turn · a interrupt/fork · esc release'
+              : 'enter live session · a fork/test/plug/discard · esc release'
+            : running
+              ? '←→ select a slot · ctrl+x stop both'
+              : finished
+                ? continuedSlot
+                  ? `continuing ${continuedSlot.toUpperCase()} in main · type follow-up · ←→ select`
+                  : 'type to send both slots another round · ←→ select · a actions'
+                : 'type one request · enter sends it to both slots'}
       />
     </Box>
   );

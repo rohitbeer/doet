@@ -130,6 +130,11 @@ export function App({
   // ---------------------------------------------------------------------
   useEffect(() => {
     const onResize = () => {
+      // Ink erases the last frame by row count, and a resize has already
+      // reflowed those rows — so the erase takes the wrong ones and leaves half
+      // the old frame threaded through the new one, permanently. Clear the
+      // screen and the scrollback and let the next frame stand alone.
+      stdout.write('\u001B[2J\u001B[3J\u001B[H');
       setCols(stdout.columns ?? 100);
       setRows(stdout.rows ?? 30);
     };

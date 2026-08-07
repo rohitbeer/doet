@@ -190,6 +190,99 @@ export async function deleteBranch(root: string, branch: string, force = true): 
   return git(root, ['branch', force ? '-D' : '-d', branch]);
 }
 
+// ---------------------------------------------------------------------------
+// What previous runs left behind
+// ---------------------------------------------------------------------------
+
+export interface VsWorktree {
+  path: string;
+  branch: string;
+  /** The doet session id carried by the branch name, when it has one. */
+  session: string | null;
+  /** False when the directory is gone and only git's bookkeeping survives. */
+  exists: boolean;
+  /** Uncommitted files. Non-zero means deleting this loses work. */
+  dirty: number;
+  /** Commits on this branch that the current checkout does not have. */
+  ahead: number;
+}
+
+/**
+ * Every worktree a VS run has left in this repository.
+ *
+ * VS deliberately keeps its branches and worktrees after a run — testing them
+ * is the point — which means they accumulate, and nothing else knows they are
+ * doet's. The `doet/vs/` branch prefix is what makes them identifiable, so it
+ * is also what makes cleaning them up safe: a worktree on any other branch is
+ * somebody else's and is never listed here.
+ */
+export async function listVsWorktrees(root: string): Promise<VsWorktree[]> {
+  const listed = await git(root, ['worktree', 'list', '--porcelain']);
+  if (!listed.ok) return [];
+
+  const found: VsWorktree[] = [];
+  let path = '';
+
+  for (const line of listed.stdout.split('\n')) {
+    if (line.startsWith('worktree ')) {
+      path = line.slice('worktree '.length);
+      continue;
+    }
+    if (!line.startsWith('branch ') || !path) continue;
+
+    const branch = line.slice('branch refs/heads/'.length);
+    if (!branch.startsWith('doet/vs/')) continue;
+
+    const exists = existsSync(path);
+    const [status, ahead] = await Promise.all([
+      exists ? git(path, ['status', '--porcelain']) : Promise.resolve(null),
+      git(root, ['rev-list', '--count', branch, '^HEAD']),
+    ]);
+
+    found.push({
+      path,
+      branch,
+      session: branch.split('/')[2] ?? null,
+      exists,
+      dirty: status?.stdout ? status.stdout.split('\n').filter(Boolean).length : 0,
+      ahead: Number(ahead.stdout) || 0,
+    });
+  }
+
+  return found;
+}
+
+/**
+ * Deletes one VS worktree and its branch.
+ *
+ * Refuses anything holding uncommitted work unless told twice — the side you
+ * did not pick is normally dirty, and it is also normally the one you meant to
+ * keep a copy of.
+ */
+export async function removeVsWorktree(
+  root: string,
+  worktree: VsWorktree,
+  force = false,
+): Promise<{ ok: boolean; message: string }> {
+  if ((worktree.dirty > 0 || worktree.ahead > 0) && !force) {
+    const held = [
+      worktree.dirty > 0 ? `${worktree.dirty} uncommitted file${worktree.dirty === 1 ? '' : 's'}` : '',
+      worktree.ahead > 0 ? `${worktree.ahead} commit${worktree.ahead === 1 ? '' : 's'}` : '',
+    ].filter(Boolean).join(' and ');
+    return { ok: false, message: `holds ${held}` };
+  }
+
+  const removed = await removeWorktree(root, worktree.path, true);
+  if (!removed.ok) {
+    return { ok: false, message: removed.stderr || removed.stdout || 'could not remove the worktree' };
+  }
+  const deleted = await deleteBranch(root, worktree.branch, true);
+  if (!deleted.ok) {
+    return { ok: false, message: `worktree removed, but the branch stayed: ${deleted.stderr}` };
+  }
+  return { ok: true, message: 'removed' };
+}
+
 /**
  * Makes a path invisible to `git status` for this clone only.
  *

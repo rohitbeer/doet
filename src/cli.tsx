@@ -16,6 +16,8 @@ import {
   deleteBranch,
   excludeLocally,
   inspectRepo,
+  listVsWorktrees,
+  removeVsWorktree,
   removeWorktree,
   vsBranchName,
 } from './core/git.js';
@@ -52,6 +54,10 @@ interface Args {
   /** `true` means "the most recent one"; a string is an id or a prefix. */
   resume?: string | true;
   listSessions?: boolean;
+  /** `--worktrees` on its own lists; `--worktrees prune` deletes. */
+  worktrees?: 'list' | 'prune';
+  /** Lets `prune` delete worktrees that still hold work. */
+  force?: boolean;
 }
 
 function asEffort(value: string | undefined): Effort | undefined {
@@ -146,6 +152,18 @@ function parseArgs(argv: string[]): Args {
       case '--sessions':
         args.listSessions = true;
         break;
+      case '--worktrees':
+        // `prune` is the only sub-word, so anything else is the next flag.
+        if (value === 'prune') {
+          args.worktrees = 'prune';
+          i++;
+        } else {
+          args.worktrees = 'list';
+        }
+        break;
+      case '--force':
+        args.force = true;
+        break;
       case '-h':
       case '--help':
         printHelp();
@@ -186,6 +204,8 @@ Options
       --first <agent>      Skip the "who answers first" prompt
   -r, --resume [id]        Reopen a stored co-code session (default: latest)
       --sessions           List stored sessions and exit
+      --worktrees          List the branches and worktrees VS runs left here
+      --worktrees prune    Delete the ones holding no work (--force: all)
   -h, --help               This text
   -v, --version            Print the version and exit
 
@@ -229,6 +249,13 @@ async function main(): Promise<void> {
 
   if (args.listSessions) {
     printSessions(args.cwd);
+    return;
+  }
+
+  // Deliberately before anything that starts an agent: tidying up after old
+  // runs should not cost two CLI sessions and a model list.
+  if (args.worktrees) {
+    await manageWorktrees(args.cwd, args.worktrees, args.force ?? false);
     return;
   }
 
@@ -432,6 +459,66 @@ function printSessions(cwd: string): void {
     process.stdout.write(`  ${meta.id}\n    ${when} · ${meta.mode ?? 'co-code'} · ${query}\n`);
   }
   process.stdout.write('\nReopen a co-code session with `doet --resume <id>`, or the latest with `doet --resume`.\n');
+}
+
+/**
+ * Lists or deletes the branches and worktrees VS runs leave behind.
+ *
+ * A finished run's UI is gone by the time you want to tidy up after it, and the
+ * cleanup you actually want is across runs rather than within one — so this is
+ * a command rather than another action in a screen you would have to relaunch
+ * two agents to reach.
+ */
+async function manageWorktrees(cwd: string, action: 'list' | 'prune', force: boolean): Promise<void> {
+  const repo = await inspectRepo(cwd);
+  if (!repo) {
+    process.stderr.write('Not a git repository, so there are no VS worktrees here.\n');
+    process.exitCode = 1;
+    return;
+  }
+
+  const worktrees = await listVsWorktrees(repo.root);
+  if (worktrees.length === 0) {
+    process.stdout.write('No VS worktrees in this repository.\n');
+    return;
+  }
+
+  if (action === 'list') {
+    process.stdout.write(`VS worktrees in ${repo.root}:\n\n`);
+    for (const worktree of worktrees) {
+      const held = [
+        worktree.dirty > 0 ? `${worktree.dirty} uncommitted` : '',
+        worktree.ahead > 0 ? `${worktree.ahead} commit${worktree.ahead === 1 ? '' : 's'}` : '',
+        worktree.exists ? '' : 'directory missing',
+      ].filter(Boolean).join(' · ');
+      process.stdout.write(`  ${worktree.branch}\n    ${worktree.path}\n    ${held || 'nothing to lose'}\n`);
+    }
+    process.stdout.write(
+      '\nDelete the ones holding nothing with `doet --worktrees prune`.\n' +
+        'Add --force to delete the rest too. Branches go with their worktrees.\n',
+    );
+    return;
+  }
+
+  let removed = 0;
+  const kept: string[] = [];
+  for (const worktree of worktrees) {
+    const outcome = await removeVsWorktree(repo.root, worktree, force);
+    if (outcome.ok) {
+      removed += 1;
+      process.stdout.write(`  removed ${worktree.branch}\n`);
+    } else {
+      kept.push(`  kept ${worktree.branch} — ${outcome.message}`);
+    }
+  }
+
+  if (kept.length > 0) process.stdout.write(`${kept.join('\n')}\n`);
+  process.stdout.write(
+    `\n${removed} removed, ${kept.length} kept.` +
+      (kept.length > 0 && !force
+        ? ' Re-run with --force to delete the rest, once you have taken what you want from them.\n'
+        : '\n'),
+  );
 }
 
 async function runVsMode(args: Args, config: ReturnType<typeof loadConfig>): Promise<void> {
