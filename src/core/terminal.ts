@@ -194,6 +194,85 @@ export function detectLauncher(): Launcher | null {
 }
 
 // ---------------------------------------------------------------------------
+// Editors
+// ---------------------------------------------------------------------------
+
+export interface Editor {
+  id: string;
+  label: string;
+  /** The CLI that opens a window, e.g. `code`. */
+  command: string;
+}
+
+const EDITORS: Editor[] = [
+  { id: 'code', label: 'VS Code', command: 'code' },
+  { id: 'cursor', label: 'Cursor', command: 'cursor' },
+  { id: 'windsurf', label: 'Windsurf', command: 'windsurf' },
+];
+
+/**
+ * The editor to open a worktree in, preferring the one doet is running inside.
+ *
+ * A worktree is a checkout, and what you want with a checkout is your editor on
+ * it — not a bare shell in it. `TERM_PROGRAM` names the editor whose terminal
+ * doet was launched from, which is nearly always the right answer.
+ */
+export function detectEditor(): Editor | null {
+  const running = { vscode: 'code', Cursor: 'cursor', windsurf: 'windsurf' }[
+    process.env.TERM_PROGRAM ?? ''
+  ];
+  const preferred = EDITORS.find((editor) => editor.id === running && has(editor.command));
+  return preferred ?? EDITORS.find((editor) => has(editor.command)) ?? null;
+}
+
+/**
+ * Opens a folder — or a `.code-workspace` file — in a new editor window.
+ *
+ * `-n` forces a new window rather than reusing the one doet was launched from,
+ * which would replace what you are looking at with the agent's copy of it.
+ */
+export function openInEditor(editor: Editor, target: string): Promise<void> {
+  return run(editor.command, ['-n', target]);
+}
+
+/**
+ * A workspace file that opens a worktree *and* starts the agent's session in
+ * that window's terminal.
+ *
+ * The obvious way to auto-run something on folder-open is `.vscode/tasks.json`,
+ * but that file would have to be written inside the worktree — where it is
+ * untracked, so doet's own `git add -A` would commit doet's plumbing into the
+ * agent's branch. Git offers no per-worktree ignore to hide it with either: only
+ * the shared `info/exclude`, which would hide the user's real `.vscode` in every
+ * tree. A workspace file carries the same `tasks` block, lives wherever you put
+ * it, and leaves the repository untouched.
+ */
+export function workspaceFile(folder: string, task: { label: string; command: string }): string {
+  return `${JSON.stringify(
+    {
+      folders: [{ path: folder }],
+      tasks: {
+        version: '2.0.0',
+        tasks: [
+          {
+            label: task.label,
+            type: 'shell',
+            command: task.command,
+            // A dedicated panel that takes focus: the session is the reason
+            // this window opened, so it should be what you are looking at.
+            presentation: { reveal: 'always', panel: 'dedicated', focus: true, clear: true },
+            runOptions: { runOn: 'folderOpen' },
+            problemMatcher: [],
+          },
+        ],
+      },
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+// ---------------------------------------------------------------------------
 // Clipboard
 // ---------------------------------------------------------------------------
 

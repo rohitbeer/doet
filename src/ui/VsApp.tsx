@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -14,8 +14,16 @@ import {
   mergeBranch,
   removeWorktree,
 } from '../core/git.js';
+import { DOET_HOME } from '../core/paths.js';
 import type { SessionStore } from '../core/sessions.js';
-import { detectLauncher, shellCommand, shellQuote } from '../core/terminal.js';
+import {
+  detectEditor,
+  detectLauncher,
+  openInEditor,
+  shellCommand,
+  shellQuote,
+  workspaceFile,
+} from '../core/terminal.js';
 import {
   SLOT_IDS,
   type AgentAdapter,
@@ -68,6 +76,12 @@ const CHROME_ROWS = 5;
  * keyboard are not.
  */
 const AGENT_DEADLINE_MS = 6_000;
+
+/**
+ * Where the editor workspace files go: outside the repository, so opening a
+ * worktree in an editor never adds a file to the branch under review.
+ */
+const WORKSPACES_DIR = join(DOET_HOME, 'workspaces');
 
 /**
  * Resolves true when the file appears, false when the caller gives up first.
@@ -324,8 +338,9 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
   const handOffToWindow = useCallback(async (slot: SlotId): Promise<boolean> => {
     const adapter = sides[slot].adapter;
     const command = adapter.interactiveCommand();
+    const editor = detectEditor();
     const launcher = detectLauncher();
-    if (!command || !launcher) return false;
+    if (!command || (!editor && !launcher)) return false;
 
     const sessionId = await withDeadline(adapter.releaseSession());
     if (!sessionId) {
@@ -343,8 +358,23 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
     // and the sentinel then never appears at all.
     const script = `${shellCommand(command.command, command.args, cwd)}; : > ${shellQuote(sentinel)}`;
 
+    // The editor wins when there is one. A worktree is a checkout, and what you
+    // want opened on a checkout is the editor — with the session running in its
+    // terminal, so the code and the agent that wrote it are in one window.
+    const where = editor?.label ?? launcher!.label;
     try {
-      await launcher.launch('/bin/sh', ['-c', script], cwd);
+      if (editor) {
+        const workspace = join(WORKSPACES_DIR, `${store.id}-${slot}.code-workspace`);
+        mkdirSync(dirname(workspace), { recursive: true });
+        writeFileSync(
+          workspace,
+          workspaceFile(cwd, { label: `doet · slot ${slot.toUpperCase()} live session`, command: script }),
+          'utf8',
+        );
+        await openInEditor(editor, workspace);
+      } else {
+        await launcher!.launch('/bin/sh', ['-c', script], cwd);
+      }
     } catch (error) {
       // The session is already released, so put it back before reporting.
       await withDeadline(adapter.resumeSession(sessionId).then(() => true));
@@ -353,9 +383,11 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
     }
 
     setOutside((current) => ({ ...current, [slot]: true }));
-    push(slot, { kind: 'note', text: `── this session is open in ${launcher.label} ──` });
+    push(slot, { kind: 'note', text: `── this session is open in ${where} ──` });
     setNotice(
-      `Slot ${slot.toUpperCase()} is yours in ${launcher.label}. doet takes it back when you close that window; the other slot carries on here.`,
+      editor
+        ? `Slot ${slot.toUpperCase()} is open in ${where} on its worktree. Say yes to "Allow automatic tasks" and its session starts in that window's terminal; doet takes it back when you close it.`
+        : `Slot ${slot.toUpperCase()} is yours in ${where}. doet takes it back when you close that window; the other slot carries on here.`,
     );
 
     // Watched rather than awaited inline: the whole point is that doet stays
@@ -380,7 +412,7 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
     })();
 
     return true;
-  }, [push, refreshInfo, sides]);
+  }, [push, refreshInfo, sides, store.id]);
 
   const takeOver = useCallback(async (
     slot: SlotId,
@@ -687,9 +719,11 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
       {
         id: 'enter',
         label: running ? 'Enter live session when this turn finishes' : 'Enter live session',
-        description: running
-          ? 'Opens in a window of its own once the turn ends, so doet stays here for the other slot. Nothing is cut short.'
-          : 'Opens in a window of its own; doet takes it back when you close that window.',
+        description: `${
+          detectEditor()
+            ? `Opens this slot's worktree in ${detectEditor()!.label}, with its live session running in that window's terminal.`
+            : 'Opens the live session in a terminal window of its own.'
+        }${running ? ' Waits for the turn to finish first — nothing is cut short.' : ''} doet stays here for the other slot and takes this one back when you close the window.`,
       },
       {
         id: 'enter-here',
