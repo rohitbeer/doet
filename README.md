@@ -514,6 +514,8 @@ npm run dev                                    # run from source, DOET_HOME=~/.d
 npm run dev -- --cwd ~/somewhere               # note the --, or npm eats the flags
 npm run typecheck
 node scripts/probe-codex.mjs                   # codex handshake only
+node scripts/probe-codex-roots.mjs             # compare worktree-root protocol options
+node --import tsx scripts/probe-codex-worktree.ts  # real VS Codex startup in a worktree
 node scripts/probe-models.mjs                  # what models your account has
 npx tsx scripts/probe-prompts.ts "question"    # exactly what each agent is sent
 npx tsx scripts/probe-launcher.ts              # where a branch would open, per environment

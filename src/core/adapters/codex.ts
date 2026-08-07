@@ -123,13 +123,68 @@ export class CodexAdapter implements AgentAdapter {
   }
 
   /**
-   * Supplying this field replaces Codex's inferred roots, so cwd must always
-   * be included alongside the extra roots. Omit it for ordinary co-code runs
-   * and preserve Codex's native defaults there.
+   * Extra writable paths for a `workspace-write` thread, as a per-thread config
+   * override.
+   *
+   * VS mode needs this: each agent works in a `git worktree`, whose `.git` is a
+   * file pointing at `<repo>/.git/worktrees/<slot>`. That path is outside the
+   * agent's cwd, so under `workspace-write` every git write the agent attempts
+   * — `git add`, `git commit`, `git stash` — is refused by the sandbox.
+   *
+   * `thread/start` also accepts a `runtimeWorkspaceRoots` field that does the
+   * same job, and it is the more purpose-built of the two. It is not used,
+   * because the app-server gates it:
+   *
+   *     thread/start.runtimeWorkspaceRoots requires experimentalApi capability
+   *
+   * and the only way to unlock it is to declare `experimentalApi` at
+   * `initialize` — which opts this client into experimental *notifications*
+   * too, the very messages `handleNotification` parses to draw the panes. A
+   * sandbox tweak is not worth putting the whole event stream on an
+   * experimental footing. `config` is an ordinary, ungated parameter.
+   *
+   * These are additional roots: cwd is already writable and is not repeated.
    */
-  private runtimeWorkspaceRoots(): string[] | undefined {
-    if (!this.opts.workspaceRoots?.length) return undefined;
-    return [...new Set([this.opts.cwd, ...this.opts.workspaceRoots])];
+  private sandboxConfig(): Record<string, unknown> | undefined {
+    const roots = this.opts.workspaceRoots?.filter((root) => root && root !== this.opts.cwd);
+    if (!roots?.length) return undefined;
+    return { sandbox_workspace_write: { writable_roots: [...new Set(roots)] } };
+  }
+
+  /**
+   * Opens a thread with the sandbox override, and again without it if this
+   * app-server will not take it.
+   *
+   * A Codex that rejects the parameter must not be able to stop a VS run from
+   * starting — but it also must not do so quietly, because the agent will then
+   * hit a refusal the first time it touches git and nothing on screen would say
+   * why. So the retry is loud.
+   */
+  private async request<T>(
+    method: string,
+    params: Record<string, unknown>,
+    config?: Record<string, unknown>,
+  ): Promise<T> {
+    if (!this.rpc) throw new Error('Codex adapter is not started.');
+    if (!config) return this.rpc.request<T>(method, params);
+
+    try {
+      return await this.rpc.request<T>(method, { ...params, config });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // Retry only when the override itself is what this Codex rejected. An
+      // auth, model, thread-lock, or server failure must retain its real error
+      // instead of being mislabeled as a sandbox compatibility problem.
+      if (!/(?:config|sandbox_workspace_write|writable_roots|unknown field)/i.test(message)) {
+        throw error;
+      }
+      this.bus.log(
+        this.id,
+        `Codex would not take the sandbox override (${message}). Continuing without it — git commands inside the worktree may be refused by the sandbox.`,
+        'warn',
+      );
+      return this.rpc.request<T>(method, params);
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -217,18 +272,19 @@ export class CodexAdapter implements AgentAdapter {
   async resumeSession(threadId: string): Promise<void> {
     this.setStatus('starting');
     await this.connect();
-    await this.rpc!.request('thread/resume', {
-      threadId,
-      cwd: this.opts.cwd,
-      ...(this.runtimeWorkspaceRoots()
-        ? { runtimeWorkspaceRoots: this.runtimeWorkspaceRoots() }
-        : {}),
-      approvalPolicy: this.approvalPolicy,
-      sandbox: this.sandbox,
-      ...(this.model ? { model: this.model } : {}),
-      // Re-asserted on resume, or a reopened thread loses the framing.
-      ...(this.opts.instructions ? { developerInstructions: this.opts.instructions } : {}),
-    });
+    await this.request(
+      'thread/resume',
+      {
+        threadId,
+        cwd: this.opts.cwd,
+        approvalPolicy: this.approvalPolicy,
+        sandbox: this.sandbox,
+        ...(this.model ? { model: this.model } : {}),
+        // Re-asserted on resume, or a reopened thread loses the framing.
+        ...(this.opts.instructions ? { developerInstructions: this.opts.instructions } : {}),
+      },
+      this.sandboxConfig(),
+    );
     // Same conversation, so the turn counter and transcript carry on.
     this.threadId = threadId;
     this.setStatus('ready');
@@ -294,17 +350,21 @@ export class CodexAdapter implements AgentAdapter {
   private async openThread(): Promise<void> {
     if (!this.rpc) throw new Error('Codex adapter is not started.');
 
-    const started = await this.rpc.request<{ thread?: { id?: string } }>('thread/start', {
+    const params = {
       // Omit entirely when unknown so Codex falls back to its own default.
       ...(this.model ? { model: this.model } : {}),
       ...(this.opts.instructions ? { developerInstructions: this.opts.instructions } : {}),
       cwd: this.opts.cwd,
-      ...(this.runtimeWorkspaceRoots()
-        ? { runtimeWorkspaceRoots: this.runtimeWorkspaceRoots() }
-        : {}),
       approvalPolicy: this.approvalPolicy,
       sandbox: this.sandbox,
-    });
+    };
+    const config = this.sandboxConfig();
+
+    const started = await this.request<{ thread?: { id?: string } }>(
+      'thread/start',
+      params,
+      config,
+    );
     this.threadId = started?.thread?.id ?? null;
     if (!this.threadId) throw new Error('codex did not return a thread id');
 
@@ -341,17 +401,18 @@ export class CodexAdapter implements AgentAdapter {
     this.setStatus('starting');
     await this.connect();
     if (threadId) {
-      await this.rpc!.request('thread/resume', {
-        threadId,
-        cwd,
-        ...(this.runtimeWorkspaceRoots()
-          ? { runtimeWorkspaceRoots: this.runtimeWorkspaceRoots() }
-          : {}),
-        approvalPolicy: this.approvalPolicy,
-        sandbox: this.sandbox,
-        ...(this.model ? { model: this.model } : {}),
-        ...(this.opts.instructions ? { developerInstructions: this.opts.instructions } : {}),
-      });
+      await this.request(
+        'thread/resume',
+        {
+          threadId,
+          cwd,
+          approvalPolicy: this.approvalPolicy,
+          sandbox: this.sandbox,
+          ...(this.model ? { model: this.model } : {}),
+          ...(this.opts.instructions ? { developerInstructions: this.opts.instructions } : {}),
+        },
+        this.sandboxConfig(),
+      );
       this.threadId = threadId;
     } else {
       await this.openThread();
@@ -395,9 +456,10 @@ export class CodexAdapter implements AgentAdapter {
     await this.rpc.request('turn/start', {
       threadId: this.threadId,
       input: [{ type: 'text', text, text_elements: [] }],
-      ...(this.runtimeWorkspaceRoots()
-        ? { runtimeWorkspaceRoots: this.runtimeWorkspaceRoots() }
-        : {}),
+      // No workspace roots here. `turn/start` takes a whole `sandboxPolicy`
+      // rather than a list of roots, and re-asserting one every turn would
+      // overwrite the thread's posture with a copy doet reconstructed. The
+      // roots belong to the worktree the thread was opened on, not to a turn.
       // Both are per-turn overrides in the app-server protocol, so the current
       // selection is re-asserted on every turn rather than only at thread start.
       ...(this.model ? { model: this.model } : {}),
