@@ -15,6 +15,8 @@ import {
   removeWorktree,
 } from '../core/git.js';
 import { DOET_HOME } from '../core/paths.js';
+import type { PricingTable } from '../core/pricing.js';
+import { elapsedFor, formatScore, scoreSlot, type SlotScore } from '../core/scoreboard.js';
 import type { SessionStore } from '../core/sessions.js';
 import {
   detectEditor,
@@ -28,6 +30,7 @@ import {
   SLOT_IDS,
   type AgentAdapter,
   type AgentInfo,
+  type MessageDelivery,
   type PermissionRequest,
   type SlotId,
   type VsResult,
@@ -37,7 +40,8 @@ import { AgentPane, type PaneLine } from './AgentPane.js';
 import { Composer } from './Composer.js';
 import { PermissionPrompt } from './PermissionPrompt.js';
 import { Picker, type PickerItem } from './Picker.js';
-import { SPINNER } from './theme.js';
+import { Scoreboard, SCOREBOARD_ROWS } from './Scoreboard.js';
+import { AGENT_COLOR, SPINNER } from './theme.js';
 
 interface Props {
   buses: Record<SlotId, Bus>;
@@ -45,6 +49,7 @@ interface Props {
   runner: VsRunner;
   store: SessionStore;
   root: string;
+  pricing: PricingTable;
 }
 
 interface SlotPermission {
@@ -57,6 +62,26 @@ interface PickSpec {
   items: PickerItem[];
   onPick: (id: string) => void;
 }
+
+/** A message being typed at one slot's exchange rather than at both slots. */
+interface ComposeSpec {
+  slot: SlotId;
+  text: string;
+}
+
+/** What the agent could actually do with a message you added, in one line. */
+const DELIVERY_NOTE: Record<MessageDelivery, string> = {
+  live: 'message added to this exchange',
+  queued: 'message queued — it goes in when this turn ends, same exchange',
+  pending: 'message saved — it rides in front of this slot\'s next prompt',
+};
+
+const DELIVERY_NOTICE: Record<MessageDelivery, string> = {
+  live: 'has it now; the exchange stays open until it has answered.',
+  queued:
+    'cannot take input mid-turn, so it goes in the moment this one ends; the exchange stays open for it.',
+  pending: 'was idle, so it rides in front of that slot\'s next prompt. Once.',
+};
 
 const MAX_PANE_LINES = 4000;
 
@@ -121,7 +146,7 @@ async function withDeadline<T>(work: Promise<T>, ms = AGENT_DEADLINE_MS): Promis
   }
 }
 
-export function VsApp({ buses, sides, runner, store, root }: Props) {
+export function VsApp({ buses, sides, runner, store, root, pricing }: Props) {
   const { exit, suspendTerminal } = useApp();
   const { stdout } = useStdout();
   const [cols, setCols] = useState(stdout.columns ?? 100);
@@ -141,6 +166,7 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
   const [permissions, setPermissions] = useState<SlotPermission[]>([]);
   const [pick, setPick] = useState<PickSpec | null>(null);
   const [pickIndex, setPickIndex] = useState(0);
+  const [compose, setCompose] = useState<ComposeSpec | null>(null);
   const [spinner, setSpinner] = useState(0);
   const [handover, setHandover] = useState<SlotId | null>(null);
   const [mergeConflict, setMergeConflict] = useState(false);
@@ -797,6 +823,21 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
             ? `── finished with error: ${side.error} ──`
             : `── branch ready · ${side.files} files · +${side.insertions} −${side.deletions} ──`,
         });
+        // Spend goes in the pane as well as the band below it, because the pane
+        // is what gets scrolled back through later.
+        push(slot, {
+          kind: 'note',
+          text: `── ${formatScore(
+            scoreSlot({
+              slot,
+              label: sides[slot].adapter.info().label,
+              model: side.model,
+              stats: runner.statsFor(slot),
+              pricing,
+              now: Date.now(),
+            }),
+          )} ──`,
+        });
         refreshInfo(slot);
       }
       setNotice(`Results saved in ${store.dir}. Select a slot: enter opens its live session; a shows all actions.`);
@@ -805,7 +846,7 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
       setRunningSlot(null);
       setNotice(error instanceof Error ? error.message : String(error));
     });
-  }, [push, refreshInfo, runner, store.dir]);
+  }, [pricing, push, refreshInfo, runner, sides, store.dir]);
 
   const continueRun = useCallback((slot: SlotId, prompt: string) => {
     setRunning(true);
@@ -828,6 +869,34 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
       setNotice(error instanceof Error ? error.message : String(error));
     });
   }, [push, refreshInfo, runner]);
+
+  /**
+   * Adds one message to a slot's exchange without disturbing the other slot.
+   *
+   * The composer at the bottom addresses both slots by design — that is what
+   * makes a VS run a fair comparison. This does the opposite on purpose: you
+   * have spotted one agent going the wrong way, and telling both would corrupt
+   * the very comparison you are watching.
+   */
+  const sendAddOn = useCallback(async (slot: SlotId, text: string) => {
+    const body = text.trim();
+    if (!body) return;
+    if (discarded[slot]) {
+      setNotice(`Slot ${slot.toUpperCase()} was discarded; there is nothing to add to.`);
+      return;
+    }
+    try {
+      const delivery = await runner.addMessage(slot, body);
+      push(slot, { kind: 'note', text: `── + ${DELIVERY_NOTE[delivery]} ──` });
+      setNotice(`Slot ${slot.toUpperCase()} ${DELIVERY_NOTICE[delivery]}`);
+    } catch (error) {
+      setNotice(
+        `Could not add that to slot ${slot.toUpperCase()}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }, [discarded, push, runner]);
 
   const scrollBy = useCallback((slot: SlotId, delta: number) => {
     const { rows: total, viewport } = metrics.current[slot];
@@ -903,6 +972,24 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
       else if (key.escape) setPick(null);
       return;
     }
+    // Typing a message to one slot takes the keyboard whole: `←`/`→` are
+    // letters here, not pane selection, and enter sends to that slot rather
+    // than starting a round.
+    if (compose) {
+      if (key.escape) {
+        setCompose(null);
+        setNotice(`Nothing sent to slot ${compose.slot.toUpperCase()}.`);
+      } else if (key.return) {
+        const { slot, text } = compose;
+        setCompose(null);
+        void sendAddOn(slot, text);
+      } else if (key.backspace || key.delete) {
+        setCompose((current) => (current ? { ...current, text: current.text.slice(0, -1) } : null));
+      } else if (char && !key.ctrl && !key.meta) {
+        setCompose((current) => (current ? { ...current, text: current.text + char } : null));
+      }
+      return;
+    }
     if (key.leftArrow) {
       setFocus('a');
       return;
@@ -945,6 +1032,10 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
     }
     if (char === 'a' && focus) {
       openActions(focus);
+      return;
+    }
+    if (char === 'm' && focus) {
+      setCompose({ slot: focus, text: '' });
       return;
     }
     if ((key.return || (key.ctrl && char === 'o')) && focus) {
@@ -996,18 +1087,32 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
    * So the window is the budget: overlays get what is left after a minimum
    * pane, and the panes get what is left after the overlays.
    */
+  const started = running || finished !== null;
   const wanted = {
     pick: pick ? Math.min(12, 5 + pick.items.length * 2) : 0,
     permission: currentPermission
       ? Math.min(18, 8 + (currentPermission.request.detail?.split('\n').length ?? 0))
       : 0,
+    compose: compose ? 3 : 0,
+    scoreboard: started ? SCOREBOARD_ROWS : 0,
   };
+  /*
+   * Rows are handed out in the order the user needs them, not the order they
+   * are drawn. A permission prompt is blocking; a message half-typed is the
+   * thing being interacted with; the scoreboard is the one that can be dropped,
+   * because everything on it is also in the panes and in `result.md`.
+   */
   const overlayBudget = Math.max(0, rows - CHROME_ROWS - MIN_PANE_ROWS);
   const permissionHeight = Math.min(wanted.permission, overlayBudget);
-  const pickHeight = Math.min(wanted.pick, overlayBudget - permissionHeight);
+  const composeHeight = Math.min(wanted.compose, overlayBudget - permissionHeight);
+  const pickHeight = Math.min(wanted.pick, overlayBudget - permissionHeight - composeHeight);
+  const scoreboardHeight = Math.min(
+    wanted.scoreboard,
+    overlayBudget - permissionHeight - composeHeight - pickHeight,
+  );
   const paneHeight = Math.max(
     MIN_PANE_ROWS,
-    rows - CHROME_ROWS - permissionHeight - pickHeight,
+    rows - CHROME_ROWS - permissionHeight - composeHeight - pickHeight - scoreboardHeight,
   );
   const active = (slot: SlotId) => ['thinking', 'working', 'awaiting-permission'].includes(infos[slot].status);
   const phase = running ? 'exchanging' : finished ? 'done' : 'idle';
@@ -1017,6 +1122,34 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
       : finished ? 'branches ready' : 'ready',
     [finished, running, runningSlot],
   );
+
+  /*
+   * Read straight off the runner rather than mirrored into state.
+   *
+   * The spinner already re-renders this component eleven times a second, so the
+   * numbers are as live as they can usefully be — and mirroring a counter that
+   * changes on every frame into `useState` would mean eleven renders a second
+   * of React bookkeeping to arrive at the same pixels. `statsFor` hands back a
+   * copy, so a render never sees a slot half-updated.
+   */
+  const now = Date.now();
+  const stats = { a: runner.statsFor('a'), b: runner.statsFor('b') };
+  const scores: SlotScore[] = SLOT_IDS.map((slot) => scoreSlot({
+    slot,
+    label: infos[slot].label,
+    model: infos[slot].resolvedModel ?? infos[slot].model,
+    stats: stats[slot],
+    pricing,
+    now,
+  }));
+  // The slower slot, not the sum: they ran at the same time.
+  const wallClock = Math.max(...SLOT_IDS.map((slot) => elapsedFor(stats[slot], now)));
+  const diffs: Partial<Record<SlotId, string>> = finished
+    ? {
+        a: `${finished.slots.a.files}f +${finished.slots.a.insertions} −${finished.slots.a.deletions}`,
+        b: `${finished.slots.b.files}f +${finished.slots.b.insertions} −${finished.slots.b.deletions}`,
+      }
+    : {};
 
   return (
     <Box flexDirection="column" width={cols} height={rows}>
@@ -1045,7 +1178,7 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
         )}
       </Box>
       <Box>
-        {SLOT_IDS.map((slot) => (
+        {SLOT_IDS.map((slot, index) => (
           <AgentPane
             key={slot}
             agent={sides[slot].cli}
@@ -1057,12 +1190,26 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
             focused={focus === slot}
             scroll={scroll[slot]}
             spinnerFrame={spinner}
+            meter={started ? formatScore(scores[index]!, { cost: false }) : undefined}
             onRows={(total, viewport) => {
               metrics.current[slot] = { rows: total, viewport };
             }}
           />
         ))}
       </Box>
+      {started && scoreboardHeight > 0 && (
+        <Box paddingX={1} height={scoreboardHeight} overflow="hidden">
+          <Scoreboard
+            scores={scores}
+            agents={{ a: sides.a.cli, b: sides.b.cli }}
+            elapsedMs={wallClock}
+            finished={!running}
+            width={cols - 2}
+            spinnerFrame={spinner}
+            diffs={diffs}
+          />
+        </Box>
+      )}
       {/* Both overlays are clamped to the rows the budget above set aside for
           them. They render their natural height otherwise, and a tall one
           would overflow the window on its own. */}
@@ -1080,25 +1227,50 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
           />
         </Box>
       )}
+      {/* Bordered in that slot's own colour and sat right above the shared
+          composer, so there is no mistaking which of the two you are about to
+          talk to. */}
+      {compose && composeHeight > 0 && (
+        <Box paddingX={1} height={composeHeight} overflow="hidden">
+          <Box
+            borderStyle="round"
+            borderColor={AGENT_COLOR[sides[compose.slot].cli]}
+            paddingX={1}
+            width={cols - 2}
+            flexWrap="nowrap"
+            overflow="hidden"
+          >
+            <Text color={AGENT_COLOR[sides[compose.slot].cli]} bold>
+              + {compose.slot.toUpperCase()}{' '}
+            </Text>
+            <Text>{compose.text}</Text>
+            <Text inverse> </Text>
+          </Box>
+        </Box>
+      )}
       <Composer
         value={input}
         choosingFirst={false}
         phase={phase}
         active={running ? sides[runningSlot ?? 'a'].cli : null}
         width={cols}
-        hint={handover
-          ? 'waiting for the turn to finish · esc cancels the handover'
-          : focus
-            ? running
-              ? 'enter live session after this turn · a interrupt/fork · esc release'
-              : 'enter live session · a fork/test/plug/discard · esc release'
-            : running
-              ? '←→ select a slot · ctrl+x stop both'
-              : finished
-                ? continuedSlot
-                  ? `continuing ${continuedSlot.toUpperCase()} in main · type follow-up · ←→ select`
-                  : 'type to send both slots another round · ←→ select · a actions'
-                : 'type one request · enter sends it to both slots'}
+        hint={compose
+          ? running
+            ? `enter adds this to slot ${compose.slot.toUpperCase()}'s exchange, without touching the other · esc cancels`
+            : `enter saves this in front of slot ${compose.slot.toUpperCase()}'s next prompt · esc cancels`
+          : handover
+            ? 'waiting for the turn to finish · esc cancels the handover'
+            : focus
+              ? running
+                ? 'enter live session after this turn · m add a message now · a interrupt/fork · esc release'
+                : 'enter live session · m message this slot · a fork/test/plug/discard · esc release'
+              : running
+                ? '←→ select a slot, then m to add a message to it · ctrl+x stop both'
+                : finished
+                  ? continuedSlot
+                    ? `continuing ${continuedSlot.toUpperCase()} in main · type follow-up · ←→ select`
+                    : 'type to send both slots another round · ←→ select · a actions · m message'
+                  : 'type one request · enter sends it to both slots'}
       />
     </Box>
   );

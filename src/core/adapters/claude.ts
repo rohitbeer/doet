@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { query, type Query, type PermissionResult, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { Bus } from '../bus.js';
-import { AGENT_LABELS } from '../relay.js';
+import { AGENT_LABELS, addedMessagePrompt, interjectionPrompt } from '../relay.js';
 import {
   ALLOW_ONCE,
   ALLOW_SESSION,
@@ -11,6 +11,7 @@ import {
   type AgentStatus,
   type Effort,
   type HandoffMode,
+  type MessageDelivery,
   type ModelChoice,
   type PermissionKind,
   type PermissionOption,
@@ -21,6 +22,29 @@ import {
 import { Deferred, renderHistory, summarizeValue, truncate, type HistoryEntry } from '../util.js';
 
 const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'bypassPermissions'] as const;
+
+/**
+ * How long the stream may go quiet, while an exchange is held open for a
+ * message added to it, before doet calls that exchange finished.
+ *
+ * A message pushed into a running session gets one of two treatments, and the
+ * CLI does not say which: it either becomes a turn of its own — so a second
+ * `result` follows and doet must wait for it — or the agent folds it into the
+ * loop it is already in, and the first `result` is the only one there will ever
+ * be. Both are observable in practice; the second happens when the message
+ * lands while the agent is working through tool calls.
+ *
+ * So the end of the exchange is detected rather than predicted: any traffic at
+ * all pushes this deadline back, and it only fires on real silence.
+ *
+ * The value is measured, not guessed. `scripts/probe-message.ts` reports the
+ * gap between one leg's reply and the first sign of the next; across runs it
+ * sits between one and three seconds, so this leaves several times that. Too
+ * short is the dangerous direction — it would end an exchange while the agent
+ * was still writing files, and in VS that means committing a half-finished
+ * branch. Too long only costs a wait, once, after the work is already done.
+ */
+export const ADD_ON_QUIET_MS = 10_000;
 
 /** Tools whose permission prompt is really "may I edit this file". */
 const EDIT_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit', 'MultiEdit']);
@@ -98,6 +122,24 @@ export class ClaudeAdapter implements AgentAdapter {
   private turn: Deferred<TurnResult> | null = null;
   private turnText = '';
   private interruptedTurn = false;
+  /**
+   * Replies already collected in this exchange. An exchange is one `send` plus
+   * any messages added to it, and each of those is its own CLI turn — so the
+   * text doet hands back is the legs joined, not just the last one.
+   */
+  private turnLegs: string[] = [];
+  /** Added messages the CLI has taken whose reply has not arrived yet. */
+  private pendingAddOns = 0;
+  /**
+   * Set while the exchange is being held open for an added message's reply.
+   * Distinct from `pendingAddOns`, which is decremented the moment a reply is
+   * *expected* — this stays true until one actually arrives, and it is what the
+   * quiet deadline tests.
+   */
+  private holdingForAddOn = false;
+  private addOnQuiet: NodeJS.Timeout | null = null;
+  /** A one-time message waiting to ride in front of the next prompt. */
+  private addOn: string | null = null;
 
   private readonly pending = new Map<string, Deferred<PermissionResult>>();
   /** Tools the user chose to allow for the rest of the session. */
@@ -298,6 +340,9 @@ export class ClaudeAdapter implements AgentAdapter {
   private async closeSession(): Promise<void> {
     this.closed = true;
     this.inboxWaiter?.resolve();
+    this.clearAddOnQuiet();
+    this.pendingAddOns = 0;
+    this.holdingForAddOn = false;
     // `return()` can end the SDK stream without a final `result` message. If
     // a caller closes mid-turn (notably process shutdown), settle the public
     // send() promise here so the adapter cannot remain permanently "mid-turn".
@@ -307,12 +352,13 @@ export class ClaudeAdapter implements AgentAdapter {
       this.interruptedTurn = true;
       activeTurn.resolve({
         agent: this.id,
-        text: this.turnText.trim(),
+        text: [...this.turnLegs, this.turnText.trim()].filter(Boolean).join('\n\n'),
         verdict: null,
         usage: this.usage,
         interrupted: true,
         error: 'Claude session closed before the turn completed.',
       });
+      this.turnLegs = [];
     }
     // Unblock anything still waiting on a permission answer, or the SDK's
     // stream will never drain.
@@ -351,11 +397,18 @@ export class ClaudeAdapter implements AgentAdapter {
     if (!this.session) throw new Error('Claude adapter is not started.');
     if (this.turn) throw new Error('Claude is already mid-turn.');
 
-    // A pending handoff rides in front of the real prompt, once.
-    const text = this.carry ? `${this.carry}\n\n---\n\n${prompt}` : prompt;
+    // A pending handoff and a one-time message both ride in front of the real
+    // prompt, once each. Handoff first: it is the context the message and the
+    // prompt are both read against.
+    const text = [this.carry, this.addOn, prompt].filter(Boolean).join('\n\n---\n\n');
     this.carry = null;
+    this.addOn = null;
 
     this.turnText = '';
+    this.turnLegs = [];
+    this.pendingAddOns = 0;
+    this.holdingForAddOn = false;
+    this.clearAddOnQuiet();
     this.interruptedTurn = false;
     this.turn = new Deferred<TurnResult>();
     this.sessionTurns += 1;
@@ -366,6 +419,39 @@ export class ClaudeAdapter implements AgentAdapter {
     // came out.
     this.bus.emit({ kind: 'prompt', agent: this.id, text, label });
 
+    this.pushUserMessage(text);
+
+    return this.turn.promise;
+  }
+
+  /**
+   * Claude Code reads its input as a stream, so a message pushed while a turn
+   * is running goes straight into the live session — no interrupt, nothing
+   * thrown away, and the CLI picks it up as soon as it comes up for air. That
+   * is what `live` claims and no more: doet does not control when the model
+   * reads it, only that it did not have to wait for doet to send it.
+   */
+  async addMessage(text: string): Promise<MessageDelivery> {
+    const body = text.trim();
+    if (!body) throw new Error('An added message needs some text.');
+    if (!this.session) throw new Error('Claude adapter is not started.');
+
+    if (!this.turn) {
+      // Nothing to add to, so it becomes the note in front of the next prompt.
+      const framed = interjectionPrompt(body);
+      this.addOn = this.addOn ? `${this.addOn}\n\n${framed}` : framed;
+      return 'pending';
+    }
+
+    const framed = addedMessagePrompt(body);
+    this.pendingAddOns += 1;
+    this.transcript.push({ role: 'user', text: framed });
+    this.bus.emit({ kind: 'prompt', agent: this.id, text: body, label: 'added to this exchange' });
+    this.pushUserMessage(framed);
+    return 'live';
+  }
+
+  private pushUserMessage(text: string): void {
     this.inbox.push({
       type: 'user',
       message: { role: 'user', content: text },
@@ -373,8 +459,26 @@ export class ClaudeAdapter implements AgentAdapter {
       session_id: this.sessionId ?? '',
     } as SDKUserMessage);
     this.inboxWaiter?.resolve();
+  }
 
-    return this.turn.promise;
+  private clearAddOnQuiet(): void {
+    if (!this.addOnQuiet) return;
+    clearTimeout(this.addOnQuiet);
+    this.addOnQuiet = null;
+  }
+
+  /** Pushed back by every message that arrives while the exchange is held open. */
+  private armAddOnQuiet(): void {
+    this.clearAddOnQuiet();
+    this.addOnQuiet = setTimeout(() => {
+      this.addOnQuiet = null;
+      if (!this.turn || !this.holdingForAddOn) return;
+      // Silence this long means the agent folded the added message into the
+      // turn it was already running: there is no second reply coming, and what
+      // came back already accounts for it.
+      this.settleTurn({ text: this.turnText.trim() });
+    }, ADD_ON_QUIET_MS);
+    this.addOnQuiet.unref?.();
   }
 
   history(): string {
@@ -383,6 +487,12 @@ export class ClaudeAdapter implements AgentAdapter {
 
   async interrupt(): Promise<void> {
     this.interruptedTurn = true;
+    // An added message the CLI has not answered yet dies with the turn it was
+    // added to. Leaving the counter up would keep the exchange open waiting for
+    // a leg that interrupting just cancelled.
+    this.pendingAddOns = 0;
+    this.holdingForAddOn = false;
+    this.clearAddOnQuiet();
     // Deny anything on screen; an interrupt with a live prompt would otherwise
     // hang until the user answers a question they no longer care about.
     for (const [id, deferred] of this.pending) {
@@ -494,6 +604,13 @@ export class ClaudeAdapter implements AgentAdapter {
     if (!this.session) return;
 
     for await (const message of this.session) {
+      // While the exchange is held open for an added message, traffic pushes
+      // the deadline back rather than cancelling it — the thing being detected
+      // is silence, and cancelling on the first sign of life would mean a
+      // folded-in message never times out at all.
+      if (this.holdingForAddOn) this.armAddOnQuiet();
+      else this.clearAddOnQuiet();
+
       switch (message.type) {
         case 'system': {
           if (message.subtype === 'init') {
@@ -605,31 +722,64 @@ export class ClaudeAdapter implements AgentAdapter {
     this.transcript.push({ role: 'assistant', text });
     this.bus.emit({ kind: 'usage', agent: this.id, usage: this.usage });
     this.bus.emit({ kind: 'message', agent: this.id, text });
+
+    const error = message.is_error ? (message.result ?? 'The turn failed.') : undefined;
+
+    // A message added mid-exchange became its own CLI turn, so this `result` is
+    // the end of a leg rather than the end of the exchange. Hold the promise —
+    // the caller asked one question and should get one answer back, covering
+    // everything it was amended with. An error or an interrupt ends it anyway;
+    // continuing to wait on an agent that just failed is how a slot hangs.
+    if (this.pendingAddOns > 0 && !error && !this.interruptedTurn) {
+      this.pendingAddOns -= 1;
+      if (text) this.turnLegs.push(text);
+      this.turnText = '';
+      this.holdingForAddOn = true;
+      this.setStatus('thinking');
+      this.armAddOnQuiet();
+      return;
+    }
+
+    this.settleTurn({ text, error });
+  }
+
+  /** Ends the exchange, joining every leg the added messages produced. */
+  private settleTurn(opts: { text: string; error?: string }): void {
+    this.clearAddOnQuiet();
+    this.pendingAddOns = 0;
+    this.holdingForAddOn = false;
+
+    const text = [...this.turnLegs, opts.text].filter(Boolean).join('\n\n');
+    this.turnLegs = [];
+
     this.bus.emit({ kind: 'turn-end', agent: this.id, text });
     this.setStatus('ready');
 
-    const result: TurnResult = {
+    const turn = this.turn;
+    this.turn = null;
+    turn?.resolve({
       agent: this.id,
       text,
       verdict: null,
       usage: this.usage,
       interrupted: this.interruptedTurn,
-      error: message.is_error ? (message.result ?? 'The turn failed.') : undefined,
-    };
-
-    const turn = this.turn;
-    this.turn = null;
-    turn?.resolve(result);
+      error: opts.error,
+    });
   }
 
   private fail(message: string): void {
     this.setStatus('error');
     this.bus.emit({ kind: 'error', agent: this.id, message, fatal: true });
+    this.clearAddOnQuiet();
+    this.pendingAddOns = 0;
+    this.holdingForAddOn = false;
     const turn = this.turn;
     this.turn = null;
+    const text = [...this.turnLegs, this.turnText].filter(Boolean).join('\n\n');
+    this.turnLegs = [];
     turn?.resolve({
       agent: this.id,
-      text: this.turnText,
+      text,
       verdict: null,
       usage: this.usage,
       interrupted: false,

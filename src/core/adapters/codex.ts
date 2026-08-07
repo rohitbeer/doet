@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Bus } from '../bus.js';
-import { AGENT_LABELS } from '../relay.js';
+import { AGENT_LABELS, addedMessagePrompt, interjectionPrompt } from '../relay.js';
 import {
   ALLOW_ONCE,
   ALLOW_SESSION,
@@ -10,6 +10,7 @@ import {
   type AgentStatus,
   type Effort,
   type HandoffMode,
+  type MessageDelivery,
   type ModelChoice,
   type PermissionOption,
   type PermissionRequest,
@@ -93,6 +94,15 @@ export class CodexAdapter implements AgentAdapter {
   private turn: Deferred<TurnResult> | null = null;
   private turnText = '';
   private interruptedTurn = false;
+  /**
+   * Replies already collected in this exchange. Codex answers each added
+   * message as its own turn, so the text doet hands back is the legs joined.
+   */
+  private turnLegs: string[] = [];
+  /** Added messages waiting for the current turn to end. */
+  private readonly queuedAddOns: string[] = [];
+  /** A one-time message waiting to ride in front of the next prompt. */
+  private addOn: string | null = null;
 
   private readonly pending = new Map<string, Deferred<unknown>>();
   /** Approval kinds the user green-lit for the rest of the session. */
@@ -438,11 +448,16 @@ export class CodexAdapter implements AgentAdapter {
     if (!this.rpc || !this.threadId) throw new Error('Codex adapter is not started.');
     if (this.turn) throw new Error('Codex is already mid-turn.');
 
-    // A pending handoff rides in front of the real prompt, once.
-    const text = this.carry ? `${this.carry}\n\n---\n\n${prompt}` : prompt;
+    // A pending handoff and a one-time message both ride in front of the real
+    // prompt, once each. Handoff first: it is the context the other two are
+    // read against.
+    const text = [this.carry, this.addOn, prompt].filter(Boolean).join('\n\n---\n\n');
     this.carry = null;
+    this.addOn = null;
 
     this.turnText = '';
+    this.turnLegs = [];
+    this.queuedAddOns.length = 0;
     this.interruptedTurn = false;
     this.turn = new Deferred<TurnResult>();
     this.sessionTurns += 1;
@@ -453,7 +468,38 @@ export class CodexAdapter implements AgentAdapter {
     // came out.
     this.bus.emit({ kind: 'prompt', agent: this.id, text, label });
 
-    await this.rpc.request('turn/start', {
+    await this.startTurn(text);
+
+    return this.turn.promise;
+  }
+
+  /**
+   * Codex's app-server takes one turn at a time — `turn/start` while a turn is
+   * running is refused, and there is no mid-turn input channel to push into.
+   *
+   * So the message is held and sent the moment the turn ends, which is the best
+   * this protocol allows and still beats the alternative: the exchange stays
+   * open until Codex has answered it, so the caller gets one result covering
+   * the original request and the amendment, exactly as it does for Claude.
+   * `queued` rather than `live` says which of the two you got.
+   */
+  async addMessage(text: string): Promise<MessageDelivery> {
+    const body = text.trim();
+    if (!body) throw new Error('An added message needs some text.');
+    if (!this.rpc || !this.threadId) throw new Error('Codex adapter is not started.');
+
+    if (!this.turn) {
+      const framed = interjectionPrompt(body);
+      this.addOn = this.addOn ? `${this.addOn}\n\n${framed}` : framed;
+      return 'pending';
+    }
+
+    this.queuedAddOns.push(body);
+    return 'queued';
+  }
+
+  private async startTurn(text: string): Promise<void> {
+    await this.rpc!.request('turn/start', {
       threadId: this.threadId,
       input: [{ type: 'text', text, text_elements: [] }],
       // No workspace roots here. `turn/start` takes a whole `sandboxPolicy`
@@ -466,8 +512,22 @@ export class CodexAdapter implements AgentAdapter {
       ...(this.effort ? { effort: this.effort } : {}),
       approvalPolicy: this.approvalPolicy,
     });
+  }
 
-    return this.turn.promise;
+  /** Opens the next leg of this exchange with a message that was waiting. */
+  private async deliverAddOn(body: string): Promise<void> {
+    const framed = addedMessagePrompt(body);
+    this.turnText = '';
+    this.transcript.push({ role: 'user', text: framed });
+    this.setStatus('thinking');
+    this.bus.emit({ kind: 'prompt', agent: this.id, text: body, label: 'added to this exchange' });
+    try {
+      await this.startTurn(framed);
+    } catch (error) {
+      // The exchange is still open and nothing else will close it, so this has
+      // to settle it rather than throw into a promise nobody is holding.
+      this.failTurn(error instanceof Error ? error.message : String(error));
+    }
   }
 
   history(): string {
@@ -476,6 +536,9 @@ export class CodexAdapter implements AgentAdapter {
 
   async interrupt(): Promise<void> {
     this.interruptedTurn = true;
+    // An added message that never got sent dies with the turn it was meant to
+    // amend; delivering it after an interrupt would restart work you stopped.
+    this.queuedAddOns.length = 0;
     for (const [id, deferred] of this.pending) {
       deferred.resolve({ decision: 'cancel' });
       this.pending.delete(id);
@@ -820,8 +883,40 @@ export class CodexAdapter implements AgentAdapter {
 
     this.transcript.push({ role: 'assistant', text });
     this.bus.emit({ kind: 'message', agent: this.id, text });
-    this.bus.emit({ kind: 'turn-end', agent: this.id, text });
-    this.setStatus('ready');
+
+    const error = turn?.status === 'failed' ? (turn.error?.message ?? 'The turn failed.') : undefined;
+
+    // A message was added while this turn ran. Codex could not take it then;
+    // it can now. The exchange is not over until it has been answered — an
+    // error or an interrupt ends it regardless, because the amendment was to
+    // work that just stopped.
+    if (!error && !this.interruptedTurn && this.queuedAddOns.length > 0) {
+      const next = this.queuedAddOns.shift()!;
+      if (text) this.turnLegs.push(text);
+      void this.deliverAddOn(next);
+      return;
+    }
+
+    this.settleTurn(text, error);
+  }
+
+  private failTurn(message: string): void {
+    if (!this.turn) return;
+    // No `turn-end` and no status change: an error event has already gone out,
+    // and a pane that prints "end of turn" under it reads like the turn worked.
+    this.settleTurn(this.turnText.trim(), message, { announce: false });
+  }
+
+  /** Ends the exchange, joining every leg the added messages produced. */
+  private settleTurn(last: string, error?: string, opts: { announce?: boolean } = {}): void {
+    this.queuedAddOns.length = 0;
+    const text = [...this.turnLegs, last].filter(Boolean).join('\n\n');
+    this.turnLegs = [];
+
+    if (opts.announce !== false) {
+      this.bus.emit({ kind: 'turn-end', agent: this.id, text });
+      this.setStatus('ready');
+    }
 
     const pending = this.turn;
     this.turn = null;
@@ -831,21 +926,7 @@ export class CodexAdapter implements AgentAdapter {
       verdict: null,
       usage: this.usage,
       interrupted: this.interruptedTurn,
-      error: turn?.status === 'failed' ? (turn.error?.message ?? 'The turn failed.') : undefined,
-    });
-  }
-
-  private failTurn(message: string): void {
-    const pending = this.turn;
-    if (!pending) return;
-    this.turn = null;
-    pending.resolve({
-      agent: this.id,
-      text: this.turnText.trim(),
-      verdict: null,
-      usage: this.usage,
-      interrupted: this.interruptedTurn,
-      error: message,
+      error,
     });
   }
 

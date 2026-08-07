@@ -124,6 +124,11 @@ export interface Usage {
   outputTokens?: number;
   cachedTokens?: number;
   totalTokens?: number;
+  /**
+   * What the CLI itself says the session cost, when it says anything. Absent is
+   * not zero — it means that agent does not report cost, and doet estimates
+   * from tokens instead rather than inventing a number here.
+   */
   costUsd?: number;
 }
 
@@ -181,6 +186,31 @@ export type DebatePhase =
   | 'synthesizing'
   | 'done'
   | 'stopped';
+
+// ---------------------------------------------------------------------------
+// One-time messages
+// ---------------------------------------------------------------------------
+
+/**
+ * What happened to a message you added to an exchange.
+ *
+ * The three outcomes are not interchangeable, which is why this is not a
+ * boolean: how soon the agent sees your message decides whether it can still
+ * change what that exchange does, and only the adapter knows which of the
+ * three its CLI could manage.
+ *
+ * `live`    — pushed into the running session there and then. When the CLI
+ *             reads it is the CLI's call, but the message is already in its
+ *             hands, so a long agentic turn can pick it up between steps.
+ * `queued`  — the protocol has no channel into a running turn at all, so doet
+ *             holds the message and sends it the instant that turn ends.
+ * `pending` — nothing was in flight, so it rides in front of that agent's next
+ *             prompt. Once, then it is gone.
+ *
+ * For the first two the exchange stays open until the agent has answered the
+ * added message as well, so the result covers the request and the amendment.
+ */
+export type MessageDelivery = 'live' | 'queued' | 'pending';
 
 // ---------------------------------------------------------------------------
 // Sessions
@@ -255,6 +285,8 @@ export interface TurnResult {
 export interface VsSlotResult {
   slot: SlotId;
   cli: CliId;
+  /** What the CLI resolved to, so a saved result can still be priced later. */
+  model: string;
   branch: string;
   worktree: string;
   commit: string;
@@ -266,6 +298,10 @@ export interface VsSlotResult {
   commits: string[];
   response: string;
   usage: Usage;
+  /** Wall-clock time this slot spent on this exchange, add-on messages included. */
+  elapsedMs: number;
+  /** One-time messages you added to this exchange while it ran. */
+  addOns: number;
   error?: string;
 }
 
@@ -273,6 +309,30 @@ export interface VsResult {
   query: string;
   base: string;
   slots: Record<SlotId, VsSlotResult>;
+  /**
+   * Wall clock for the run, which is the slower slot rather than the sum: both
+   * slots work at once, so adding their times would describe a race nobody ran.
+   */
+  elapsedMs: number;
+}
+
+/**
+ * What one slot has spent so far — read live by the UI while a run is in
+ * flight, and folded into `VsSlotResult` when it finishes.
+ *
+ * `activeMs` is time spent inside exchanges, not since the slot started, so a
+ * slot you left idle for ten minutes does not look like it worked for ten
+ * minutes.
+ */
+export interface VsSlotStats {
+  /** Exchanges this slot has completed. */
+  turns: number;
+  /** One-time messages added to this slot's exchanges. */
+  addOns: number;
+  activeMs: number;
+  /** Set while an exchange is in flight; the UI counts up from it. */
+  runningSince?: number;
+  usage: Usage;
 }
 
 export interface AgentAdapter {
@@ -285,6 +345,22 @@ export interface AgentAdapter {
    * `label` is what the pane shows above the prompt it renders.
    */
   send(prompt: string, label?: string): Promise<TurnResult>;
+  /**
+   * Add one message to the exchange this agent is in the middle of.
+   *
+   * Distinct from `send`, which starts an exchange and is refused while one is
+   * running. This is the "I forgot to say" channel: the agent is already
+   * working, you have thought of something, and waiting for it to finish means
+   * correcting the wrong implementation instead of steering the right one.
+   *
+   * Whether the agent can hear you *now* or only at the next turn boundary is
+   * the CLI's business, not the caller's, so the promise resolves with which of
+   * the two happened. Either way the exchange stays open until the agent has
+   * answered the added message, so `send`'s result covers the whole thing.
+   *
+   * It is one-time by construction: nothing is remembered after delivery.
+   */
+  addMessage(text: string): Promise<MessageDelivery>;
   interrupt(): Promise<void>;
   /** Answer a pending permission request by option id. */
   resolvePermission(requestId: string, optionId: string): void;

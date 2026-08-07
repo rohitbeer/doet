@@ -9,7 +9,9 @@ doet has two modes:
   you choose.
 - **vs** sends the exact same task to two independent sessions in isolated git
   worktrees. Each slot can use Claude or Codex, including the same CLI/model on
-  both sides, with its own model and effort setting.
+  both sides, with its own model and effort setting. It reports what each side
+  spent getting there — time, tokens, cost — and lets you add a message to one
+  slot's exchange while it is still running, without touching the other.
 
 Both agents run in panes inside doet, and **every permission prompt from either
 agent surfaces in doet** with the same three keys. You approve a Codex shell
@@ -103,9 +105,17 @@ live session from doet's composer, or explicitly discard that branch/worktree.
 Plug-in commits keep the main tree clean, so the other result can be stacked
 afterwards. Follow-up turns are committed and appended to the session Markdown.
 
+A band under the panes counts what each slot is spending as it spends it —
+time, tokens in and out, and cost — and settles into the final comparison when
+both finish. See [What a run costs](#what-a-run-costs).
+
+Select a slot and press `m` to add a message to the exchange that slot is in the
+middle of. See [Adding a message mid-exchange](#adding-a-message-mid-exchange).
+
 | Key | |
 |---|---|
 | `enter` | send; with a pane selected, enter its live session |
+| `m` | with a pane selected, add a message to that slot's exchange |
 | `a` / `s` / `d` | answer a permission prompt |
 | `←` / `→` | select a pane — works while a turn is running; `tab` cycles |
 | `ctrl+o` | enter the selected pane's current live session |
@@ -141,6 +151,72 @@ afterwards. Follow-up turns are committed and appended to the session Markdown.
 | `/quit` | exit |
 
 Everything you set this way persists to `~/.doet/config.json`.
+
+## Adding a message mid-exchange
+
+Two minutes into a VS run you notice slot A has misread the task. Waiting for it
+to finish means reviewing the wrong implementation and then asking for it again;
+interrupting throws away the two minutes. Neither is what you want — you want to
+tell it the thing you forgot to say.
+
+Select the slot and press `m`. What you type goes to that slot and no other,
+which matters here more than anywhere else in doet: the composer at the bottom
+addresses both slots on purpose, and telling both would corrupt the comparison
+you are running. The pane and the notice line say what happened to it:
+
+| | |
+|---|---|
+| `message added to this exchange` | pushed straight into the running session — Claude Code takes input on a live stream, so it did not have to wait for a turn boundary |
+| `message queued …` | Codex's protocol has no channel into a running turn, so doet holds it and sends it the instant that turn ends |
+| `message saved …` | nothing was running, so it rides in front of that slot's next prompt |
+
+For the first two the exchange stays open until the agent has answered the added
+message as well, so what comes back — the reply, the diff, the time, the tokens —
+covers the request *and* the amendment as one result. It is one-time by
+construction: nothing is remembered after delivery. Interrupting a turn drops a
+message that has not been sent yet, since the work it was amending has stopped.
+
+Claude Code decides for itself what to do with a message pushed into a live
+session, and does not say which it chose: it either answers in a turn of its own
+or folds the message into the loop it is already running. doet handles both by
+watching for the stream to go quiet rather than assuming a second reply is
+coming — so when it was folded in, that slot sits for about ten seconds after
+the work is done before doet calls the exchange finished and commits. It shows
+up in that slot's reported time; the `+1 msg` beside it is why.
+
+Each one is recorded in `session.md` with how it landed, because a message the
+agent read mid-turn steered that work and one that only arrived at the next
+prompt did not, and later that is the only place the difference still exists.
+
+## What a run costs
+
+Every VS run reports what each slot spent: wall-clock time, tokens in and out,
+and cost. It counts up live under the panes rather than appearing at the end,
+because "this side is taking twice as long" is worth knowing while there is
+still time to do something about it. The same table is written to `result.md`.
+
+Time is per exchange, not since launch, so a slot you left idle does not look
+busy. The run's wall clock is the slower slot rather than the sum — both ran at
+once, and adding them would describe a race nobody ran.
+
+Cost is the part doet refuses to guess at. Claude Code reports what a session
+cost and doet shows that figure. Codex reports tokens and no cost at all, so its
+cell reads `–` until you say what its model is worth:
+
+```jsonc
+// ~/.doet/config.json — USD per million tokens
+{
+  "pricing": {
+    "gpt-5": { "input": 1.25, "output": 10 }
+  }
+}
+```
+
+Keys match a model id exactly, or as a prefix — one `claude-sonnet-5` entry
+covers every dated variant of it. Anything doet worked out this way is shown
+with a `~`, so an estimate never reads as a figure the CLI reported. doet ships
+no built-in price list on purpose: prices change, doet cannot verify them, and a
+confidently wrong dollar amount is worse than an honest blank.
 
 ## Opening a session in its own CLI
 
@@ -486,10 +562,12 @@ One directory per run, written as it happens rather than at the end:
 ```
 
 VS runs use that same sessions directory, with `a.md`, `b.md`, `result.md` and
-mode/slot/branch/worktree metadata in `meta.json`. Their checkouts live under
-`~/.doet/worktrees/<session>/`; worktrees and branches remain after exit unless
-you choose the confirmed **Discard artifacts** action, so they can still be
-tested without risking an accidental cleanup.
+mode/slot/branch/worktree metadata in `meta.json`. `result.md` carries the
+diffstats and a **Spend** table — time, tokens and cost per slot. Messages you
+added mid-exchange are in `session.md`, each with how it reached the agent.
+Their checkouts live under `~/.doet/worktrees/<session>/`; worktrees and
+branches remain after exit unless you choose the confirmed **Discard artifacts**
+action, so they can still be tested without risking an accidental cleanup.
 
 Live, not write-once, because the markdown is not only a record — a `full`
 handoff reads `session.md` back to brief a replacement session, and a file that
@@ -529,8 +607,11 @@ npx tsx scripts/probe-fork.ts [claude|codex]   # branch, and prove the live one 
 npx tsx scripts/probe-takeover.ts [claude|codex|midturn]   # the full handover
 node --import tsx scripts/probe-git.ts                     # worktree/merge semantics
 node --import tsx scripts/probe-vs.ts                      # same prompt, two branches, Markdown
+npx tsx scripts/probe-message.ts [claude|codex|both]       # break into a live turn, for real
+npx tsx scripts/probe-vs-live.ts                           # a whole VS run against both CLIs
 script -q /dev/null npx tsx scripts/probe-suspend.tsx      # Ink hands over a real tty
 npx tsx scripts/probe-ui.tsx [debate|picker|gist|wrap|focus|takeover]   # one TUI frame
+npx tsx scripts/probe-vs-ui.tsx [running|message|done|narrow]           # one VS frame
 ```
 
 `probe-takeover` runs the agent's own CLI in the middle of the round-trip
@@ -544,8 +625,18 @@ the conductor still awaiting it. `probe-suspend` needs a real tty — hence
 can run unattended — they prove the round-trip works, but the TUI is what puts a
 human in that seat.
 
-`probe-ui` drives the real `App` against stub agents through a fake stdin, so
-layout, wrapping and the pickers can be checked without a TTY or a model call.
+`probe-message` is the one that matters for mid-exchange messages: it gives a
+real CLI a long task, breaks in three seconds later with an instruction it would
+never volunteer, and fails unless the word comes back — so it can tell the
+difference between a message that was delivered and one that was merely sent.
+`probe-vs-live` does the same inside a whole VS run, and checks the message
+reached one slot and only one.
+
+`probe-ui` and `probe-vs-ui` drive the real `App` and `VsApp` against stub
+agents through a fake stdin, so layout, wrapping, the pickers, the scoreboard
+band and the per-slot message composer can be checked without a TTY or a model
+call. `probe-vs-ui done` builds a real repository and worktrees, because the
+finished frame reports commits and diffs.
 Ink pulls input with `read()` after a `readable` event and swallows the first
 200ms while probing for the kitty keyboard protocol, which is why that stub is a
 small queue rather than a bare `EventEmitter`.
@@ -566,3 +657,11 @@ small queue rather than a bare `EventEmitter`.
 - A `full` handoff sends the whole session as one message. On a long co-code run
   that is a large prompt, and doet does not check it against the model's
   context window first.
+- Cost is reported only where the CLI reports it (Claude Code) or where you have
+  set a rate (`pricing` in `~/.doet/config.json`). doet ships no price list.
+- A message added to an exchange reaches the agent as its own turn, so it costs
+  a turn's worth of context. It cannot un-do work already done — it redirects
+  what happens next.
+- In co-code, typing while an exchange runs already queues a note for the next
+  agent to receive. `m` is the VS equivalent, aimed at one slot; the two are
+  separate mechanisms.

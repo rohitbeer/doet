@@ -674,10 +674,17 @@ async function runVsMode(args: Args, config: ReturnType<typeof loadConfig>): Pro
       await adapter.setModel(selected, effort);
     }
 
-    const runner = new VsRunner({ sides, store, root: repo.root });
+    const runner = new VsRunner({ sides, store, root: repo.root, pricing: config.pricing });
     keepArtifacts = true;
     const app = render(
-      <VsApp buses={buses} sides={sides} runner={runner} store={store} root={repo.root} />,
+      <VsApp
+        buses={buses}
+        sides={sides}
+        runner={runner}
+        store={store}
+        root={repo.root}
+        pricing={config.pricing}
+      />,
       { exitOnCtrlC: false },
     );
     await app.waitUntilExit();

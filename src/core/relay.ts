@@ -270,3 +270,22 @@ carry it forward.
 ${text}
 </human>`;
 }
+
+/**
+ * Injected when the user adds a message to an exchange the agent is already
+ * working on.
+ *
+ * The last line is the whole point. Without it an agent that has been running
+ * for two minutes reads a new user message as a new request and starts over,
+ * throwing away the work the message was meant to redirect.
+ */
+export function addedMessagePrompt(text: string): string {
+  return `The human added this to the request you are working on right now. It takes
+priority over anything it contradicts. Fold it into the work in progress and
+carry on with the same task — do not start over, and do not treat it as a new
+request.
+
+<human>
+${text}
+</human>`;
+}

@@ -18,11 +18,19 @@ import {
   type CliId,
   type DoetEvent,
   type Effort,
+  type MessageDelivery,
   type SlotId,
   type VsResult,
 } from './types.js';
 
 export const SESSIONS_DIR = join(DOET_HOME, 'sessions');
+
+/** How an added message reached the agent, in words the transcript can keep. */
+const DELIVERY_NOTE: Record<MessageDelivery, string> = {
+  live: 'delivered mid-exchange',
+  queued: 'delivered at the end of the running turn',
+  pending: 'held for the next prompt',
+};
 
 /**
  * Enough to reopen a doet session later: which agent sessions it was driving,
@@ -264,6 +272,24 @@ export class SessionStore {
     );
   }
 
+  /**
+   * A one-time message added to an exchange already running.
+   *
+   * The delivery is recorded with it because it changes what the message meant:
+   * one the agent read mid-turn steered that work, one that only landed at the
+   * next prompt did not, and six months later the transcript is the only place
+   * that difference still exists.
+   */
+  appendVsAddOn(slot: SlotId, text: string, delivery: MessageDelivery): void {
+    this.safely(() =>
+      appendFileSync(
+        this.path('session.md'),
+        `\n### Slot ${slot.toUpperCase()} — added message (${DELIVERY_NOTE[delivery]})\n\n${text}\n`,
+        'utf8',
+      ),
+    );
+  }
+
   /** Marks where a resumed run picks the markdown back up. */
   noteResumed(): void {
     this.safely(() =>
@@ -350,7 +376,11 @@ export class SessionStore {
     return path;
   }
 
-  finalizeVs(result: VsResult): string {
+  /**
+   * `scoreboard` is rendered by the caller rather than here: pricing is config,
+   * and the store has no business reading config to write a file.
+   */
+  finalizeVs(result: VsResult, scoreboard = ''): string {
     const path = this.path('result.md');
     this.safely(() => {
       const sections = (['a', 'b'] as const).map((slot) => {
@@ -365,7 +395,8 @@ export class SessionStore {
       });
       writeFileSync(
         path,
-        `# VS result\n\nBase: \`${result.base}\`\n\n${sections.join('\n\n')}\n`,
+        `# VS result\n\nBase: \`${result.base}\`\n\n${sections.join('\n\n')}\n` +
+          (scoreboard ? `\n${scoreboard}` : ''),
         'utf8',
       );
     });

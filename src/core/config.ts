@@ -3,6 +3,7 @@ import { join, dirname } from 'node:path';
 import { DOET_HOME } from './paths.js';
 import { EFFORTS, type AgentId, type AgentSessionSettings, type Effort } from './types.js';
 import { DEFAULT_DEBATE, type DebateConfig } from './conductor.js';
+import { DEFAULT_PRICING, readPricing, type PricingTable } from './pricing.js';
 
 /** A model choice as the user made it: which model, and how hard it should think. */
 export interface ModelSetting {
@@ -54,6 +55,12 @@ export interface DoetConfig {
     approvalPolicy: string;
     sandbox: string;
   };
+  /**
+   * USD per million tokens, by model id, for the models whose CLI does not
+   * report a cost of its own. Yours to fill in — see `pricing.ts` for why doet
+   * ships none.
+   */
+  pricing: PricingTable;
 }
 
 export const DEFAULT_CONFIG: DoetConfig = {
@@ -80,6 +87,7 @@ export const DEFAULT_CONFIG: DoetConfig = {
   // `untrusted` + `workspace-write` is the combination that actually produces
   // prompts. Loosening either one silently removes the thing doet is for.
   codex: { approvalPolicy: 'untrusted', sandbox: 'workspace-write' },
+  pricing: DEFAULT_PRICING,
 };
 
 export const CONFIG_PATH = join(DOET_HOME, 'config.json');
@@ -138,6 +146,7 @@ export function loadConfig(): DoetConfig {
           DEFAULT_CONFIG.codex.sandbox,
         ),
       },
+      pricing: readPricing(raw.pricing),
     };
   } catch {
     // A broken config should not stop doet from starting.

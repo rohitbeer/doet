@@ -70,6 +70,26 @@ export function formatUsd(value: number | undefined): string {
   return value < 0.01 ? '<$0.01' : `$${value.toFixed(2)}`;
 }
 
+/**
+ * `4.2s`, `1m 07s`, `2h 03m` — an elapsed time that stays the same width as it
+ * grows, so a running counter does not make the row it sits in reflow.
+ *
+ * Sub-minute keeps a decimal because the difference between a 3-second and a
+ * 9-second turn is worth seeing; past a minute it stops pretending to that
+ * precision.
+ */
+export function formatDuration(ms: number | undefined): string {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return '–';
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+
+  const total = Math.round(seconds);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, '0')}m`;
+  return `${minutes}m ${String(total % 60).padStart(2, '0')}s`;
+}
+
 // ---------------------------------------------------------------------------
 // Session history
 // ---------------------------------------------------------------------------
