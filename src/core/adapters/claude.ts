@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { query, type Query, type PermissionResult, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { Bus } from '../bus.js';
-import { AGENT_LABELS, addedMessagePrompt, interjectionPrompt } from '../relay.js';
+import { AGENT_LABELS, addedMessagePrompt } from '../relay.js';
 import {
   ALLOW_ONCE,
   ALLOW_SESSION,
@@ -11,7 +11,7 @@ import {
   type AgentStatus,
   type Effort,
   type HandoffMode,
-  type MessageDelivery,
+  type InFlightDelivery,
   type ModelChoice,
   type PermissionKind,
   type PermissionOption,
@@ -138,8 +138,6 @@ export class ClaudeAdapter implements AgentAdapter {
    */
   private holdingForAddOn = false;
   private addOnQuiet: NodeJS.Timeout | null = null;
-  /** A one-time message waiting to ride in front of the next prompt. */
-  private addOn: string | null = null;
 
   private readonly pending = new Map<string, Deferred<PermissionResult>>();
   /** Tools the user chose to allow for the rest of the session. */
@@ -397,12 +395,9 @@ export class ClaudeAdapter implements AgentAdapter {
     if (!this.session) throw new Error('Claude adapter is not started.');
     if (this.turn) throw new Error('Claude is already mid-turn.');
 
-    // A pending handoff and a one-time message both ride in front of the real
-    // prompt, once each. Handoff first: it is the context the message and the
-    // prompt are both read against.
-    const text = [this.carry, this.addOn, prompt].filter(Boolean).join('\n\n---\n\n');
+    // A pending handoff rides in front of the real prompt, once.
+    const text = this.carry ? `${this.carry}\n\n---\n\n${prompt}` : prompt;
     this.carry = null;
-    this.addOn = null;
 
     this.turnText = '';
     this.turnLegs = [];
@@ -431,17 +426,15 @@ export class ClaudeAdapter implements AgentAdapter {
    * is what `live` claims and no more: doet does not control when the model
    * reads it, only that it did not have to wait for doet to send it.
    */
-  async addMessage(text: string): Promise<MessageDelivery> {
+  async addMessage(text: string): Promise<InFlightDelivery | null> {
     const body = text.trim();
     if (!body) throw new Error('An added message needs some text.');
     if (!this.session) throw new Error('Claude adapter is not started.');
 
-    if (!this.turn) {
-      // Nothing to add to, so it becomes the note in front of the next prompt.
-      const framed = interjectionPrompt(body);
-      this.addOn = this.addOn ? `${this.addOn}\n\n${framed}` : framed;
-      return 'pending';
-    }
+    // Nothing in flight, so there is nothing to add this *to*. Saying so is the
+    // whole job here — the caller sends it as a plain turn, which is what the
+    // agent should get when it is sitting idle.
+    if (!this.turn) return null;
 
     const framed = addedMessagePrompt(body);
     this.pendingAddOns += 1;

@@ -69,18 +69,18 @@ interface ComposeSpec {
   text: string;
 }
 
-/** What the agent could actually do with a message you added, in one line. */
+/** What the agent did with a message you sent it, in one line. */
 const DELIVERY_NOTE: Record<MessageDelivery, string> = {
   live: 'message added to this exchange',
   queued: 'message queued — it goes in when this turn ends, same exchange',
-  pending: 'message saved — it rides in front of this slot\'s next prompt',
+  sent: 'message sent — this slot only',
 };
 
 const DELIVERY_NOTICE: Record<MessageDelivery, string> = {
   live: 'has it now; the exchange stays open until it has answered.',
   queued:
     'cannot take input mid-turn, so it goes in the moment this one ends; the exchange stays open for it.',
-  pending: 'was idle, so it rides in front of that slot\'s next prompt. Once.',
+  sent: 'was idle, so it is working on that now. The other slot is untouched.',
 };
 
 const MAX_PANE_LINES = 4000;
@@ -871,32 +871,59 @@ export function VsApp({ buses, sides, runner, store, root, pricing }: Props) {
   }, [push, refreshInfo, runner]);
 
   /**
-   * Adds one message to a slot's exchange without disturbing the other slot.
+   * Sends one message to one slot, without disturbing the other.
    *
    * The composer at the bottom addresses both slots by design — that is what
    * makes a VS run a fair comparison. This does the opposite on purpose: you
    * have spotted one agent going the wrong way, and telling both would corrupt
    * the very comparison you are watching.
+   *
+   * A busy slot folds it into what it is doing; an idle one just answers it.
+   * The second case is a turn like any other, so it is shown like one — the
+   * pane goes to work, and the branch and the board update when it lands.
    */
   const sendAddOn = useCallback(async (slot: SlotId, text: string) => {
     const body = text.trim();
     if (!body) return;
     if (discarded[slot]) {
-      setNotice(`Slot ${slot.toUpperCase()} was discarded; there is nothing to add to.`);
+      setNotice(`Slot ${slot.toUpperCase()} was discarded; there is nothing to send to.`);
       return;
     }
     try {
-      const delivery = await runner.addMessage(slot, body);
+      const { delivery, turn } = await runner.addMessage(slot, body);
       push(slot, { kind: 'note', text: `── + ${DELIVERY_NOTE[delivery]} ──` });
       setNotice(`Slot ${slot.toUpperCase()} ${DELIVERY_NOTICE[delivery]}`);
+      if (!turn) return;
+
+      setRunning(true);
+      setRunningSlot(slot);
+      const result = await turn.catch((error: unknown) => ({
+        error: error instanceof Error ? error.message : String(error),
+      }));
+      setRunning(runner.isRunning);
+      setRunningSlot((current) => (current === slot ? null : current));
+      refreshInfo(slot);
+      push(slot, {
+        kind: result.error ? 'error' : 'note',
+        text: result.error ? `── ended with error: ${result.error} ──` : '── done ──',
+      });
+      // The branch moved, so the numbers on the board have to move with it.
+      const diff = await runner.diffFor(slot).catch(() => null);
+      if (diff) {
+        setFinished((current) => current && ({
+          ...current,
+          slots: { ...current.slots, [slot]: { ...current.slots[slot], ...diff } },
+        }));
+      }
+      setNotice(result.error || `Slot ${slot.toUpperCase()} finished. Its branch has the change.`);
     } catch (error) {
       setNotice(
-        `Could not add that to slot ${slot.toUpperCase()}: ${
+        `Could not send that to slot ${slot.toUpperCase()}: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
     }
-  }, [discarded, push, runner]);
+  }, [discarded, push, refreshInfo, runner]);
 
   const scrollBy = useCallback((slot: SlotId, delta: number) => {
     const { rows: total, viewport } = metrics.current[slot];
@@ -1255,21 +1282,21 @@ export function VsApp({ buses, sides, runner, store, root, pricing }: Props) {
         active={running ? sides[runningSlot ?? 'a'].cli : null}
         width={cols}
         hint={compose
-          ? running
+          ? active(compose.slot)
             ? `enter adds this to slot ${compose.slot.toUpperCase()}'s exchange, without touching the other · esc cancels`
-            : `enter saves this in front of slot ${compose.slot.toUpperCase()}'s next prompt · esc cancels`
+            : `enter sends this to slot ${compose.slot.toUpperCase()} now — that slot only · esc cancels`
           : handover
             ? 'waiting for the turn to finish · esc cancels the handover'
             : focus
               ? running
-                ? 'enter live session after this turn · m add a message now · a interrupt/fork · esc release'
-                : 'enter live session · m message this slot · a fork/test/plug/discard · esc release'
+                ? 'enter live session after this turn · m message this slot now · a interrupt/fork · esc release'
+                : 'enter live session · m message this slot alone · a fork/test/plug/discard · esc release'
               : running
-                ? '←→ select a slot, then m to add a message to it · ctrl+x stop both'
+                ? '←→ select a slot, then m to message that one alone · ctrl+x stop both'
                 : finished
                   ? continuedSlot
                     ? `continuing ${continuedSlot.toUpperCase()} in main · type follow-up · ←→ select`
-                    : 'type to send both slots another round · ←→ select · a actions · m message'
+                    : 'type to send both slots another round · ←→ select · m message one · a actions'
                   : 'type one request · enter sends it to both slots'}
       />
     </Box>

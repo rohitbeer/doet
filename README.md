@@ -10,8 +10,8 @@ doet has two modes:
 - **vs** sends the exact same task to two independent sessions in isolated git
   worktrees. Each slot can use Claude or Codex, including the same CLI/model on
   both sides, with its own model and effort setting. It reports what each side
-  spent getting there — time, tokens, cost — and lets you add a message to one
-  slot's exchange while it is still running, without touching the other.
+  spent getting there — time, tokens, cost — and lets you message either slot on
+  its own, mid-run or between runs, without the other one hearing it.
 
 Both agents run in panes inside doet, and **every permission prompt from either
 agent surfaces in doet** with the same three keys. You approve a Codex shell
@@ -109,13 +109,14 @@ A band under the panes counts what each slot is spending as it spends it —
 time, tokens in and out, and cost — and settles into the final comparison when
 both finish. See [What a run costs](#what-a-run-costs).
 
-Select a slot and press `m` to add a message to the exchange that slot is in the
-middle of. See [Adding a message mid-exchange](#adding-a-message-mid-exchange).
+Select a slot and press `m` to send that slot a message — into the exchange it
+is running, or as a turn of its own if it is idle, but always to that slot alone
+and always straight away. See [Messaging one slot](#messaging-one-slot).
 
 | Key | |
 |---|---|
 | `enter` | send; with a pane selected, enter its live session |
-| `m` | with a pane selected, add a message to that slot's exchange |
+| `m` | with a pane selected, message that slot alone — now |
 | `a` / `s` / `d` | answer a permission prompt |
 | `←` / `→` | select a pane — works while a turn is running; `tab` cycles |
 | `ctrl+o` | enter the selected pane's current live session |
@@ -152,29 +153,33 @@ middle of. See [Adding a message mid-exchange](#adding-a-message-mid-exchange).
 
 Everything you set this way persists to `~/.doet/config.json`.
 
-## Adding a message mid-exchange
+## Messaging one slot
 
-Two minutes into a VS run you notice slot A has misread the task. Waiting for it
-to finish means reviewing the wrong implementation and then asking for it again;
-interrupting throws away the two minutes. Neither is what you want — you want to
-tell it the thing you forgot to say.
+The composer at the bottom addresses both slots, because that is what makes a VS
+run a comparison. Sometimes you need the opposite: to say something to *one*
+agent, in its own session, about its own branch — a correction to slot A that
+would corrupt the comparison if slot B heard it too.
 
-Select the slot and press `m`. What you type goes to that slot and no other,
-which matters here more than anywhere else in doet: the composer at the bottom
-addresses both slots on purpose, and telling both would corrupt the comparison
-you are running. The pane and the notice line say what happened to it:
+Select the slot and press `m`. What you type goes to that slot and no other, and
+it goes **now**. Nothing is saved for later and nothing is attached to whatever
+the shared composer sends next.
+
+What that means depends only on whether that slot happens to be working, and you
+do not have to know in advance which:
 
 | | |
 |---|---|
-| `message added to this exchange` | pushed straight into the running session — Claude Code takes input on a live stream, so it did not have to wait for a turn boundary |
-| `message queued …` | Codex's protocol has no channel into a running turn, so doet holds it and sends it the instant that turn ends |
-| `message saved …` | nothing was running, so it rides in front of that slot's next prompt |
+| **busy** | it joins the exchange in flight. `message added to this exchange` means it went straight into the running session (Claude Code reads input on a live stream); `message queued` means Codex's protocol has no channel into a running turn, so doet sends it the few seconds later when that turn ends. Either way the exchange stays open until the agent has answered it, so the reply, diff, time and tokens you get back cover the request *and* the amendment as one result. |
+| **idle** | it is simply that slot's next turn, opened immediately. The pane goes to work, the result is committed to that slot's branch, and the board updates. |
 
-For the first two the exchange stays open until the agent has answered the added
-message as well, so what comes back — the reply, the diff, the time, the tokens —
-covers the request *and* the amendment as one result. It is one-time by
-construction: nothing is remembered after delivery. Interrupting a turn drops a
-message that has not been sent yet, since the work it was amending has stopped.
+Two minutes into a run you notice slot A has misread the task: `m`, say so, and
+it folds that into the work rather than finishing the wrong thing. After a run,
+`m` on either slot is how you iterate on one implementation without touching the
+other — which is a different thing from `plug`, since the slot stays on its own
+branch.
+
+Interrupting a turn drops a queued message that has not been sent yet, since the
+work it was amending has stopped.
 
 Claude Code decides for itself what to do with a message pushed into a live
 session, and does not say which it chose: it either answers in a turn of its own
@@ -184,9 +189,10 @@ coming — so when it was folded in, that slot sits for about ten seconds after
 the work is done before doet calls the exchange finished and commits. It shows
 up in that slot's reported time; the `+1 msg` beside it is why.
 
-Each one is recorded in `session.md` with how it landed, because a message the
-agent read mid-turn steered that work and one that only arrived at the next
-prompt did not, and later that is the only place the difference still exists.
+Each message is recorded in `session.md` with how it landed, because one the
+agent read mid-turn steered work already under way and one sent to an idle agent
+started work of its own, and later that is the only place the difference still
+exists.
 
 ## What a run costs
 
@@ -564,7 +570,7 @@ One directory per run, written as it happens rather than at the end:
 VS runs use that same sessions directory, with `a.md`, `b.md`, `result.md` and
 mode/slot/branch/worktree metadata in `meta.json`. `result.md` carries the
 diffstats and a **Spend** table — time, tokens and cost per slot. Messages you
-added mid-exchange are in `session.md`, each with how it reached the agent.
+sent to a single slot are in `session.md`, each with how it reached the agent.
 Their checkouts live under `~/.doet/worktrees/<session>/`; worktrees and
 branches remain after exit unless you choose the confirmed **Discard artifacts**
 action, so they can still be tested without risking an accidental cleanup.
@@ -629,8 +635,13 @@ human in that seat.
 real CLI a long task, breaks in three seconds later with an instruction it would
 never volunteer, and fails unless the word comes back — so it can tell the
 difference between a message that was delivered and one that was merely sent.
-`probe-vs-live` does the same inside a whole VS run, and checks the message
-reached one slot and only one.
+It also measures the gap between one leg's reply and the first sign of the next,
+which is where the adapter's quiet deadline comes from, and fails if a real
+restart ever creeps close to it.
+
+`probe-vs-live` covers both halves inside a whole VS run: a message added to a
+slot mid-exchange, and one sent to a slot that is idle. Each checks that the
+change landed on that slot's branch and that the other slot never saw it.
 
 `probe-ui` and `probe-vs-ui` drive the real `App` and `VsApp` against stub
 agents through a fake stdin, so layout, wrapping, the pickers, the scoreboard
@@ -659,9 +670,11 @@ small queue rather than a bare `EventEmitter`.
   context window first.
 - Cost is reported only where the CLI reports it (Claude Code) or where you have
   set a rate (`pricing` in `~/.doet/config.json`). doet ships no price list.
-- A message added to an exchange reaches the agent as its own turn, so it costs
-  a turn's worth of context. It cannot un-do work already done — it redirects
-  what happens next.
-- In co-code, typing while an exchange runs already queues a note for the next
-  agent to receive. `m` is the VS equivalent, aimed at one slot; the two are
-  separate mechanisms.
+- A message to one slot reaches the agent as a turn, so it costs a turn's worth
+  of context. It cannot un-do work already done — it redirects what happens next.
+- `m` on a slot that is still finishing up — committing and diffing after its
+  reply — is refused rather than queued, since sending then would race that.
+  It is a second or two; try again.
+- In co-code, typing while an exchange runs queues a note for the *next agent in
+  the relay* to receive. That is a different mechanism from `m`, which addresses
+  one VS slot and sends immediately.

@@ -25,11 +25,11 @@ import {
 
 export const SESSIONS_DIR = join(DOET_HOME, 'sessions');
 
-/** How an added message reached the agent, in words the transcript can keep. */
+/** How a message reached the agent, in words the transcript can keep. */
 const DELIVERY_NOTE: Record<MessageDelivery, string> = {
   live: 'delivered mid-exchange',
   queued: 'delivered at the end of the running turn',
-  pending: 'held for the next prompt',
+  sent: 'sent as its own turn',
 };
 
 /**
@@ -273,18 +273,18 @@ export class SessionStore {
   }
 
   /**
-   * A one-time message added to an exchange already running.
+   * A message sent to one slot on its own.
    *
    * The delivery is recorded with it because it changes what the message meant:
-   * one the agent read mid-turn steered that work, one that only landed at the
-   * next prompt did not, and six months later the transcript is the only place
-   * that difference still exists.
+   * one the agent read mid-turn steered work that was already under way, one
+   * sent to an idle agent started work of its own, and six months later the
+   * transcript is the only place that difference still exists.
    */
   appendVsAddOn(slot: SlotId, text: string, delivery: MessageDelivery): void {
     this.safely(() =>
       appendFileSync(
         this.path('session.md'),
-        `\n### Slot ${slot.toUpperCase()} — added message (${DELIVERY_NOTE[delivery]})\n\n${text}\n`,
+        `\n### Slot ${slot.toUpperCase()} — message (${DELIVERY_NOTE[delivery]})\n\n${text}\n`,
         'utf8',
       ),
     );

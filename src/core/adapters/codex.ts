@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { Bus } from '../bus.js';
-import { AGENT_LABELS, addedMessagePrompt, interjectionPrompt } from '../relay.js';
+import { AGENT_LABELS, addedMessagePrompt } from '../relay.js';
 import {
   ALLOW_ONCE,
   ALLOW_SESSION,
@@ -10,7 +10,7 @@ import {
   type AgentStatus,
   type Effort,
   type HandoffMode,
-  type MessageDelivery,
+  type InFlightDelivery,
   type ModelChoice,
   type PermissionOption,
   type PermissionRequest,
@@ -101,8 +101,6 @@ export class CodexAdapter implements AgentAdapter {
   private turnLegs: string[] = [];
   /** Added messages waiting for the current turn to end. */
   private readonly queuedAddOns: string[] = [];
-  /** A one-time message waiting to ride in front of the next prompt. */
-  private addOn: string | null = null;
 
   private readonly pending = new Map<string, Deferred<unknown>>();
   /** Approval kinds the user green-lit for the rest of the session. */
@@ -448,12 +446,9 @@ export class CodexAdapter implements AgentAdapter {
     if (!this.rpc || !this.threadId) throw new Error('Codex adapter is not started.');
     if (this.turn) throw new Error('Codex is already mid-turn.');
 
-    // A pending handoff and a one-time message both ride in front of the real
-    // prompt, once each. Handoff first: it is the context the other two are
-    // read against.
-    const text = [this.carry, this.addOn, prompt].filter(Boolean).join('\n\n---\n\n');
+    // A pending handoff rides in front of the real prompt, once.
+    const text = this.carry ? `${this.carry}\n\n---\n\n${prompt}` : prompt;
     this.carry = null;
-    this.addOn = null;
 
     this.turnText = '';
     this.turnLegs = [];
@@ -483,16 +478,14 @@ export class CodexAdapter implements AgentAdapter {
    * the original request and the amendment, exactly as it does for Claude.
    * `queued` rather than `live` says which of the two you got.
    */
-  async addMessage(text: string): Promise<MessageDelivery> {
+  async addMessage(text: string): Promise<InFlightDelivery | null> {
     const body = text.trim();
     if (!body) throw new Error('An added message needs some text.');
     if (!this.rpc || !this.threadId) throw new Error('Codex adapter is not started.');
 
-    if (!this.turn) {
-      const framed = interjectionPrompt(body);
-      this.addOn = this.addOn ? `${this.addOn}\n\n${framed}` : framed;
-      return 'pending';
-    }
+    // Nothing in flight, so there is nothing to add this *to*. The caller sends
+    // it as a plain turn instead — which for an idle thread is all it ever was.
+    if (!this.turn) return null;
 
     this.queuedAddOns.push(body);
     return 'queued';

@@ -192,25 +192,33 @@ export type DebatePhase =
 // ---------------------------------------------------------------------------
 
 /**
- * What happened to a message you added to an exchange.
+ * What happened to a message you sent one agent.
  *
- * The three outcomes are not interchangeable, which is why this is not a
- * boolean: how soon the agent sees your message decides whether it can still
- * change what that exchange does, and only the adapter knows which of the
- * three its CLI could manage.
+ * All three mean it reached that agent and nothing else did; they differ only
+ * in whether there was work in progress to fold it into. Nothing is ever held
+ * back waiting for something else to happen — a message you send is a message
+ * that has been sent.
  *
- * `live`    — pushed into the running session there and then. When the CLI
- *             reads it is the CLI's call, but the message is already in its
- *             hands, so a long agentic turn can pick it up between steps.
- * `queued`  — the protocol has no channel into a running turn at all, so doet
- *             holds the message and sends it the instant that turn ends.
- * `pending` — nothing was in flight, so it rides in front of that agent's next
- *             prompt. Once, then it is gone.
+ * `live`   — pushed into the running session there and then. When the CLI reads
+ *            it is the CLI's call, but the message is already in its hands, so
+ *            a long agentic turn can pick it up between steps.
+ * `queued` — the protocol has no channel into a running turn at all, so doet
+ *            holds the message for the few seconds until that turn ends.
+ * `sent`   — the agent was idle, so the message is simply its next turn, opened
+ *            immediately.
  *
  * For the first two the exchange stays open until the agent has answered the
  * added message as well, so the result covers the request and the amendment.
  */
-export type MessageDelivery = 'live' | 'queued' | 'pending';
+export type MessageDelivery = 'live' | 'queued' | 'sent';
+
+/**
+ * What an adapter managed on its own. `null` means there was no exchange in
+ * flight to add to, and the caller should open a turn instead — a decision the
+ * adapter deliberately does not make for it, since only the caller knows what
+ * else that would disturb.
+ */
+export type InFlightDelivery = 'live' | 'queued';
 
 // ---------------------------------------------------------------------------
 // Sessions
@@ -358,9 +366,11 @@ export interface AgentAdapter {
    * the two happened. Either way the exchange stays open until the agent has
    * answered the added message, so `send`'s result covers the whole thing.
    *
-   * It is one-time by construction: nothing is remembered after delivery.
+   * Resolves `null` when no exchange was in flight. It deliberately does not
+   * fall back to opening one: nothing is stored, nothing is deferred, and the
+   * caller sends the message as an ordinary turn instead.
    */
-  addMessage(text: string): Promise<MessageDelivery>;
+  addMessage(text: string): Promise<InFlightDelivery | null>;
   interrupt(): Promise<void>;
   /** Answer a pending permission request by option id. */
   resolvePermission(requestId: string, optionId: string): void;

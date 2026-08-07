@@ -6,7 +6,7 @@ import type {
   AgentId,
   AgentInfo,
   Effort,
-  MessageDelivery,
+  InFlightDelivery,
   ModelChoice,
   TurnResult,
 } from '../src/core/types.js';
@@ -102,9 +102,9 @@ function fakeAgent(id: AgentId, cwd: string, file: string): AgentAdapter {
         arm();
       });
     },
-    addMessage: async (text): Promise<MessageDelivery> => {
-      // Idle: the message would ride in front of the next prompt instead.
-      if (!settle) return 'pending';
+    addMessage: async (text): Promise<InFlightDelivery | null> => {
+      // Idle: nothing to add this to, so the runner opens a turn for it.
+      if (!settle) return null;
       added.push(text);
       legs.push(`applied: ${text}`);
       bill(4, 2);
@@ -166,7 +166,7 @@ const pending = runner.run(prompt);
 await new Promise((resolve) => setTimeout(resolve, 20));
 
 const addOn = 'also handle the empty case';
-const delivery = await runner.addMessage('a', addOn);
+const { delivery } = await runner.addMessage('a', addOn);
 if (delivery !== 'live') throw new Error(`expected a live delivery, got ${delivery}`);
 if (runner.statsFor('a').runningSince == null) {
   throw new Error('slot A should still be mid-exchange while a message is added to it');
@@ -216,6 +216,39 @@ if (!(await git(repo, ['show', `${result.slots.b.branch}:b.txt`])).ok) {
   throw new Error('slot B change is missing from its branch');
 }
 
+/*
+ * A message to a slot that is *not* working.
+ *
+ * This is the case that was wrong first time round: the text was stashed and
+ * prepended to whatever went to both slots next, so it neither reached the
+ * agent when it was sent nor stayed private to that slot when it finally did.
+ * It has to be a turn of its own, on that slot only, right now.
+ */
+const seenBefore = seen.length;
+const soloB = 'while you are idle: also write b-note.txt';
+const solo = await runner.addMessage('b', soloB);
+if (solo.delivery !== 'sent') throw new Error(`an idle slot should send, got ${solo.delivery}`);
+if (!solo.turn) throw new Error('a sent message should hand back the turn it opened');
+if (runner.statsFor('b').runningSince == null) {
+  throw new Error('slot B should be working the moment the message is sent');
+}
+
+const soloTurn = await solo.turn;
+if (soloTurn.error) throw new Error(`the solo turn failed: ${soloTurn.error}`);
+if (seen[seen.length - 1] !== soloB) {
+  throw new Error(`slot B did not receive the message verbatim: ${JSON.stringify(seen.slice(seenBefore))}`);
+}
+if (seen.length !== seenBefore + 1) {
+  throw new Error('a message to one slot must not reach the other');
+}
+if (runner.statsFor('a').turns !== 1) {
+  throw new Error('slot A should not have taken a turn for a message addressed to B');
+}
+// It landed on B's branch, not in limbo waiting for a shared prompt.
+if (!(await git(repo, ['show', `${result.slots.b.branch}:b.txt`])).stdout.includes(soloB)) {
+  throw new Error('the solo turn was not committed to that slot’s branch');
+}
+
 // Plug A, continue its exact live adapter in main, then stack B. Each step
 // commits, so the main tree stays clean enough for the next result.
 const pluggedA = await mergeBranch(repo, result.slots.a.branch, { squash: true });
@@ -242,6 +275,9 @@ if (!session.includes(prompt)
 }
 if (!session.includes(addOn) || !session.includes('delivered mid-exchange')) {
   throw new Error('the added message and how it landed should both be in session.md');
+}
+if (!session.includes(soloB) || !session.includes('sent as its own turn')) {
+  throw new Error('the solo message and how it landed should both be in session.md');
 }
 if (!saved.includes('## Spend') || !saved.includes('Wall clock:')) {
   throw new Error('result.md should carry the scoreboard');

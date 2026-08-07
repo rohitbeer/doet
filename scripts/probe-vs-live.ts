@@ -92,7 +92,7 @@ const nudged = new Promise<string>((resolve) => {
   setTimeout(() => {
     runner
       .addMessage('a', ADD_ON)
-      .then(resolve)
+      .then(({ delivery }) => resolve(delivery))
       .catch((error: unknown) => resolve(`failed: ${String(error)}`));
   }, BREAK_IN_MS);
 });
@@ -128,6 +128,32 @@ console.log(`\nslot A's greet.sh:\n${wroteIt.trim()}`);
 if (!/PINEAPPLE/i.test(wroteIt)) {
   throw new Error('slot A never applied the message added mid-run');
 }
+
+/*
+ * The other half: a message to a slot that is sitting idle.
+ *
+ * It must go to that agent's own session there and then, and to that agent
+ * only — not be held back for whatever prompt the shared composer sends next.
+ */
+console.log('\n=== message to an idle slot ===');
+const IDLE_MSG = 'Add a second file called note.txt containing the word MANGO.';
+const idle = await runner.addMessage('b', IDLE_MSG);
+console.log(`  delivery ${idle.delivery}`);
+if (idle.delivery !== 'sent') throw new Error(`an idle slot should send, got ${idle.delivery}`);
+if (!idle.turn) throw new Error('a sent message should hand back the turn it opened');
+const idleTurn = await idle.turn;
+if (idleTurn.error) throw new Error(`the idle-slot turn failed: ${idleTurn.error}`);
+
+const note = await git(repo, ['show', `${result.slots.b.branch}:note.txt`]);
+console.log(`  slot B's note.txt: ${JSON.stringify(note.stdout.trim())}`);
+if (!note.ok || !/MANGO/i.test(note.stdout)) {
+  throw new Error('the message to the idle slot never reached its branch');
+}
+// And slot A, which was not addressed, has no such file.
+if ((await git(repo, ['show', `${result.slots.a.branch}:note.txt`])).ok) {
+  throw new Error('a message to one slot leaked into the other');
+}
+console.log('  slot A untouched');
 
 const saved = readFileSync(join(store.dir, 'result.md'), 'utf8');
 console.log(`\n${saved.slice(saved.indexOf('## Spend'))}`);

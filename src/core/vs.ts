@@ -26,6 +26,18 @@ export interface VsSide {
   worktree: Worktree;
 }
 
+/** The outcome of sending one slot a message, and the work it started. */
+export interface AddedMessage {
+  delivery: MessageDelivery;
+  /**
+   * Set only when the message opened a turn of its own, so the caller can show
+   * that slot as working and react when it finishes. Absent when the message
+   * joined an exchange that was already running — that exchange's own promise
+   * already covers it.
+   */
+  turn?: Promise<TurnResult>;
+}
+
 /**
  * Runs two isolated implementations of one request. There is deliberately no
  * relay, judging, or synthesis here: each session sees the exact same prompt
@@ -117,28 +129,74 @@ export class VsRunner {
   }
 
   /**
-   * Adds one message to whatever exchange this slot is in the middle of.
+   * Sends one message to one slot, and to no other.
    *
-   * Deliberately not routed through `continue`: this is not another turn, it is
-   * an amendment to the turn already running. Whether the agent hears it now or
-   * at the next boundary is the adapter's answer, not the runner's, and it comes
-   * back so the UI can say which happened rather than guessing.
+   * The composer at the bottom of the screen addresses both slots, because that
+   * is what makes a VS run a comparison. This is the other thing you need: you
+   * are talking to *that* agent, in its own session, about its own branch.
+   *
+   * Which of the two shapes it takes depends only on whether that slot happens
+   * to be working, and the caller does not have to know in advance:
+   *
+   *   busy — the adapter folds it into the exchange in flight (`live`/`queued`),
+   *          and that exchange stays open until the agent has answered it.
+   *   idle — it is simply that slot's next turn, opened here and now.
+   *
+   * The idle case used to hold the text back and prepend it to whatever went to
+   * *both* slots next, which was wrong twice over: the message did not reach the
+   * agent when you sent it, and when it finally did it arrived stapled to a
+   * shared prompt. Nothing is stored now — a message you send is sent.
    */
-  async addMessage(slot: SlotId, text: string): Promise<MessageDelivery> {
+  async addMessage(slot: SlotId, text: string): Promise<AddedMessage> {
     const side = this.sides[slot];
     const body = text.trim();
     if (!body) throw new Error('An added message needs some text.');
 
+    // Asked of the adapter rather than inferred from `inflight`: only the
+    // adapter knows whether a turn is genuinely open, and a turn that ends
+    // between the check and the call would otherwise be added to thin air.
     const delivery = await side.adapter.addMessage(body);
+    if (delivery) {
+      this.stats[slot].addOns += 1;
+      this.store.appendVsAddOn(slot, body, delivery);
+      return { delivery };
+    }
+
+    if (this.inflight[slot]) {
+      // The adapter is between turns but the runner is still finishing up —
+      // committing, diffing. Sending now would race that.
+      throw new Error(`Slot ${slot.toUpperCase()} is finishing its last turn. Try again in a moment.`);
+    }
+
     this.stats[slot].addOns += 1;
-    this.store.appendVsAddOn(slot, body, delivery);
-    return delivery;
+    this.store.appendVsAddOn(slot, body, 'sent');
+    // The cleanup is part of the promise handed back, not a chain hung off the
+    // side of it. A caller awaiting `turn` and then asking `isRunning` has to
+    // see the slot already free — with a separate chain that is a coin flip on
+    // microtask ordering, and losing it leaves the UI stuck showing "running".
+    const turn = this.runSolo(side, body, `slot ${side.slot.toUpperCase()} message`)
+      .finally(() => {
+        delete this.inflight[slot];
+      });
+    this.inflight[slot] = turn;
+    return { delivery: 'sent', turn };
   }
 
-  /** Continue one plugged-in implementation in its original live session. */
+  /**
+   * Continue one implementation in its own live session.
+   *
+   * Gated per slot rather than on the whole run: the two slots are independent,
+   * and there is no reason a turn on one should be refused because the other is
+   * busy.
+   */
   async continue(slot: SlotId, prompt: string): Promise<TurnResult> {
-    if (this.isRunning) throw new Error('Another VS turn is already in progress.');
-    const pending = this.runFollowUp(this.sides[slot], prompt);
+    if (this.inflight[slot]) throw new Error(`Slot ${slot.toUpperCase()} is already working.`);
+    this.store.appendVsFollowUp(slot, prompt);
+    const pending = this.runSolo(
+      this.sides[slot],
+      prompt,
+      `slot ${slot.toUpperCase()} follow-up`,
+    );
     this.inflight[slot] = pending;
     try {
       return await pending;
@@ -147,12 +205,12 @@ export class VsRunner {
     }
   }
 
-  private async runFollowUp(side: VsSide, prompt: string): Promise<TurnResult> {
-    this.store.appendVsFollowUp(side.slot, prompt);
+  /** One turn for one slot, committed wherever that slot is currently working. */
+  private async runSolo(side: VsSide, prompt: string, label: string): Promise<TurnResult> {
     let turn: TurnResult;
     const done = this.beginExchange(side.slot);
     try {
-      turn = await side.adapter.send(prompt, `slot ${side.slot.toUpperCase()} follow-up`);
+      turn = await side.adapter.send(prompt, label);
     } catch (error) {
       turn = {
         agent: side.cli,
@@ -165,17 +223,29 @@ export class VsRunner {
     } finally {
       done();
     }
-    this.store.appendVsTurn(side.slot, `${side.adapter.info().label} follow-up`, turn.text, turn.error);
+    this.store.appendVsTurn(side.slot, `${side.adapter.info().label} — ${label}`, turn.text, turn.error);
     this.store.writeSlotHistory(side.slot, side.adapter.info().label, side.adapter.history());
-    if (side.adapter.info().cwd === this.root) {
-      const commit = await commitAll(this.root, `doet vs: slot ${side.slot} follow-up`);
-      if (commit.changed) {
-        this.store.appendNote(
-          `Committed slot ${side.slot.toUpperCase()} follow-up in main as ${commit.sha.slice(0, 12)}.`,
-        );
-      }
+
+    // Committed in whichever tree the slot is working in — its own worktree
+    // before you plug it in, the main tree afterwards. A slot that answered a
+    // message and left the result uncommitted would show a stale diff and lose
+    // the work to the next branch operation.
+    const cwd = side.adapter.info().cwd;
+    const inMain = cwd === this.root;
+    const commit = await commitAll(cwd, `doet vs: slot ${side.slot} ${inMain ? 'follow-up' : 'message'}`);
+    if (commit.changed) {
+      this.store.appendNote(
+        `Committed slot ${side.slot.toUpperCase()} in ${inMain ? 'main' : side.worktree.branch} as ${commit.sha.slice(0, 12)}.`,
+      );
     }
     return turn;
+  }
+
+  /** What a slot's branch looks like now — for refreshing the board after a solo turn. */
+  async diffFor(slot: SlotId): Promise<{ files: number; insertions: number; deletions: number }> {
+    const side = this.sides[slot];
+    const diff = await diffSummary(this.root, side.worktree.base, side.worktree.branch);
+    return { files: diff.files, insertions: diff.insertions, deletions: diff.deletions };
   }
 
   /**

@@ -4,7 +4,8 @@
  * TTY or a live model call.
  *
  *   npx tsx scripts/probe-vs-ui.tsx running   both slots working, live counters
- *   npx tsx scripts/probe-vs-ui.tsx message   a message being typed at slot B
+ *   npx tsx scripts/probe-vs-ui.tsx message   a message being typed at a busy slot
+ *   npx tsx scripts/probe-vs-ui.tsx idle      the same at a finished slot — sends now
  *   npx tsx scripts/probe-vs-ui.tsx done      the finished scoreboard
  *   npx tsx scripts/probe-vs-ui.tsx narrow    the same, in a small window
  */
@@ -22,7 +23,7 @@ import type {
   AgentAdapter,
   AgentId,
   AgentInfo,
-  MessageDelivery,
+  InFlightDelivery,
   SlotId,
   TurnResult,
 } from '../src/core/types.js';
@@ -51,7 +52,7 @@ await git(repo, ['commit', '-qm', 'base']);
 const head = (await inspectRepo(repo))!.head;
 
 /** Long enough that the scene still shows a run in flight when the frame is grabbed. */
-const WORK_MS = scene === 'done' ? 250 : 60_000;
+const WORK_MS = scene === 'done' || scene === 'idle' ? 250 : 60_000;
 
 function stub(id: AgentId, model: string, cwd: string): AgentAdapter {
   const info: AgentInfo = {
@@ -84,7 +85,8 @@ function stub(id: AgentId, model: string, cwd: string): AgentAdapter {
           resolve({ agent: id, text: 'done', verdict: null, usage: info.usage, interrupted: false });
         }, WORK_MS),
       ),
-    addMessage: async (): Promise<MessageDelivery> => (id === 'claude' ? 'live' : 'queued'),
+    addMessage: async (): Promise<InFlightDelivery | null> =>
+      info.status === 'ready' ? null : id === 'claude' ? 'live' : 'queued',
     interrupt: async () => {},
     resolvePermission: () => {},
     setModel: async () => {},
@@ -200,9 +202,17 @@ type('add a --json flag', 300);
 type('\r', 380);
 
 if (scene === 'message') {
-  type('[C', 600); // right arrow selects slot B
+  type('\u001b[C', 600); // right arrow selects slot B
   type('m', 660);
   type('use the existing flag parser, do not add a dependency', 720);
+}
+
+// The same keys, but after both slots have finished. The hint has to say the
+// message sends now rather than joining an exchange — there is no exchange.
+if (scene === 'idle') {
+  type('\u001b[C', 800);
+  type('m', 870);
+  type('now add a test for the empty case', 940);
 }
 
 setTimeout(() => {
@@ -211,4 +221,4 @@ setTimeout(() => {
   process.stdout.write(`${last}\n`);
   process.stdout.write(`\n[scene=${scene}, captured ${frames.length} frames]\n`);
   process.exit(0);
-}, 1_100);
+}, 1_400);
