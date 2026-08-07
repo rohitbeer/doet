@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Box, Text, useApp, useInput, useStdout } from 'ink';
@@ -14,7 +15,7 @@ import {
   removeWorktree,
 } from '../core/git.js';
 import type { SessionStore } from '../core/sessions.js';
-import { detectLauncher, shellCommand } from '../core/terminal.js';
+import { detectLauncher, shellCommand, shellQuote } from '../core/terminal.js';
 import {
   SLOT_IDS,
   type AgentAdapter,
@@ -68,6 +69,29 @@ const CHROME_ROWS = 5;
  */
 const AGENT_DEADLINE_MS = 6_000;
 
+/**
+ * Resolves true when the file appears, false when the caller gives up first.
+ *
+ * Polling rather than `fs.watch`: the file is created in a temp directory by a
+ * shell in another window, and watching a directory for a file that does not
+ * exist yet is the one thing `fs.watch` is unreliable at across platforms.
+ */
+function waitForFile(path: string, cancelled: () => boolean): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setInterval(() => {
+      if (existsSync(path)) {
+        clearInterval(timer);
+        rmSync(path, { force: true });
+        resolve(true);
+      } else if (cancelled()) {
+        clearInterval(timer);
+        resolve(false);
+      }
+    }, 400);
+    timer.unref?.();
+  });
+}
+
 async function withDeadline<T>(work: Promise<T>, ms = AGENT_DEADLINE_MS): Promise<T | null> {
   let timer: NodeJS.Timeout | undefined;
   try {
@@ -110,6 +134,8 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
   const [plugged, setPlugged] = useState<Record<SlotId, boolean>>({ a: false, b: false });
   const [discarded, setDiscarded] = useState<Record<SlotId, boolean>>({ a: false, b: false });
   const [scroll, setScroll] = useState<Record<SlotId, number>>({ a: 0, b: 0 });
+  /** Slots whose session is currently open in a window of its own. */
+  const [outside, setOutside] = useState<Record<SlotId, boolean>>({ a: false, b: false });
   const metrics = useRef<Record<SlotId, { rows: number; viewport: number }>>({
     a: { rows: 0, viewport: 1 },
     b: { rows: 0, viewport: 1 },
@@ -122,6 +148,8 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
   const cancelHandover = useRef(false);
   /** Keeps forked branch and worktree names unique per slot. */
   const forkCount = useRef<Record<SlotId, number>>({ a: 0, b: 0 });
+  /** Set to take a slot back by hand when its window never reported closing. */
+  const reclaim = useRef<Record<SlotId, boolean>>({ a: false, b: false });
 
   const refreshInfo = useCallback((slot: SlotId) => {
     setInfos((previous) => ({ ...previous, [slot]: sides[slot].adapter.info() }));
@@ -279,11 +307,95 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
    * actions menu, for when the agent is off down the wrong path and stopping it
    * is the point.
    */
-  const takeOver = useCallback(async (slot: SlotId, opts: { interrupt?: boolean } = {}) => {
+  /**
+   * Opens a slot's live session in a window of its own.
+   *
+   * This is the better default here, and for a reason particular to VS: the
+   * other slot is usually still working. Suspending doet to give this terminal
+   * to one agent blanks the screen the other one is streaming to, and hides its
+   * permission prompts — so the agent you did not touch quietly blocks on a
+   * question nobody can see. In a separate window, doet stays up and keeps
+   * answering for the other side.
+   *
+   * It is still a handover and not a fork: doet lets go of the session, so it
+   * has to learn when you are done with it. No launcher reports a window
+   * closing, so the command it runs ends by touching a file doet watches for.
+   */
+  const handOffToWindow = useCallback(async (slot: SlotId): Promise<boolean> => {
+    const adapter = sides[slot].adapter;
+    const command = adapter.interactiveCommand();
+    const launcher = detectLauncher();
+    if (!command || !launcher) return false;
+
+    const sessionId = await withDeadline(adapter.releaseSession());
+    if (!sessionId) {
+      setNotice(
+        `${adapter.info().label} did not release its session in time — nothing was handed over.`,
+      );
+      return true;
+    }
+
+    const cwd = adapter.info().cwd;
+    const sentinel = join(tmpdir(), `doet-${slot}-${sessionId.slice(0, 8)}-${Date.now()}.done`);
+    // `;` rather than `&&`: doet must be told the window is finished even when
+    // the CLI exits non-zero, or the session stays out for good. The path is
+    // quoted because a temp directory with a space in it makes `>` ambiguous,
+    // and the sentinel then never appears at all.
+    const script = `${shellCommand(command.command, command.args, cwd)}; : > ${shellQuote(sentinel)}`;
+
+    try {
+      await launcher.launch('/bin/sh', ['-c', script], cwd);
+    } catch (error) {
+      // The session is already released, so put it back before reporting.
+      await withDeadline(adapter.resumeSession(sessionId).then(() => true));
+      setNotice(`Could not open a window: ${error instanceof Error ? error.message : String(error)}`);
+      return true;
+    }
+
+    setOutside((current) => ({ ...current, [slot]: true }));
+    push(slot, { kind: 'note', text: `── this session is open in ${launcher.label} ──` });
+    setNotice(
+      `Slot ${slot.toUpperCase()} is yours in ${launcher.label}. doet takes it back when you close that window; the other slot carries on here.`,
+    );
+
+    // Watched rather than awaited inline: the whole point is that doet stays
+    // usable while one slot is out.
+    void (async () => {
+      const returned = await waitForFile(sentinel, () => reclaim.current[slot]);
+      const resumed = await withDeadline(adapter.resumeSession(sessionId).then(() => true));
+      reclaim.current[slot] = false;
+      setOutside((current) => ({ ...current, [slot]: false }));
+      refreshInfo(slot);
+      push(slot, {
+        kind: resumed ? 'note' : 'error',
+        text: resumed
+          ? '── back in doet, with everything you did ──'
+          : `── could not re-attach to ${sessionId.slice(0, 8)} ──`,
+      });
+      setNotice(
+        resumed
+          ? `Slot ${slot.toUpperCase()} is back${returned ? '' : ' (reclaimed)'}, and kept what you did.`
+          : `Slot ${slot.toUpperCase()} did not re-attach. Reopen it with its own CLI.`,
+      );
+    })();
+
+    return true;
+  }, [push, refreshInfo, sides]);
+
+  const takeOver = useCallback(async (
+    slot: SlotId,
+    opts: { interrupt?: boolean; here?: boolean } = {},
+  ) => {
     if (takingOver.current) {
       // Returning in silence is why a wedged handover reads as a dead keyboard:
       // every further press does nothing and says nothing about why.
       setNotice('Still handing a session over — press ctrl+c twice to force-quit doet.');
+      return;
+    }
+    if (outside[slot]) {
+      setNotice(
+        `Slot ${slot.toUpperCase()} is already open in another window. Close it, or press a → Re-attach now.`,
+      );
       return;
     }
     if (discarded[slot]) {
@@ -303,6 +415,7 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
     let sessionId: string | null = null;
     let failure = '';
     let cancelled = false;
+    let toWindow = false;
     try {
       if (running) {
         if (opts.interrupt) {
@@ -325,6 +438,15 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
         setNotice(`Handover cancelled. Slot ${slot.toUpperCase()} carries on in doet.`);
         return;
       }
+
+      // A window first, and this terminal only when nothing here can open one —
+      // an editor's integrated terminal with no tmux, typically. Taking this
+      // terminal blinds the other slot, so it is the fallback, not the plan.
+      if (!opts.here && await handOffToWindow(slot)) {
+        toWindow = true;
+        return;
+      }
+
       // A deadline here does not mean "carry on anyway": if doet has not let go
       // of the session, handing the same id to an interactive CLI would put two
       // writers on it. Timing out aborts the handover instead.
@@ -365,8 +487,9 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
       setHandover(null);
       refreshInfo(slot);
     }
-    // A cancelled handover never left doet, so it has nothing to report.
-    if (cancelled) return;
+    // A cancelled handover never left doet, and one that went to a window
+    // reports for itself when the window closes.
+    if (cancelled || toWindow) return;
     push(slot, {
       kind: failure ? 'error' : 'note',
       text: failure ? `handover ended: ${failure}` : '── live session returned to doet ──',
@@ -536,13 +659,43 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
       setNotice(`Slot ${slot.toUpperCase()} was discarded; only its saved Markdown remains.`);
       return;
     }
+    if (outside[slot]) {
+      setPick({
+        title: `Slot ${slot.toUpperCase()} is open in another window`,
+        items: [
+          {
+            id: 'reclaim',
+            label: 'Re-attach now',
+            description:
+              'Only once you have closed that window. Two processes on one session corrupt it.',
+          },
+          { id: 'cancel', label: 'Leave it open', description: 'It comes back on its own when you close it.' },
+        ],
+        onPick: (choice) => {
+          setPick(null);
+          if (choice === 'reclaim') {
+            reclaim.current[slot] = true;
+            setNotice(`Taking slot ${slot.toUpperCase()} back…`);
+          }
+        },
+      });
+      setPickIndex(1);
+      return;
+    }
+
     const items: PickerItem[] = [
       {
         id: 'enter',
         label: running ? 'Enter live session when this turn finishes' : 'Enter live session',
         description: running
-          ? 'doet waits for the turn, then gives you this terminal. Nothing is cut short. Exit the CLI to come back.'
-          : 'Exit the agent CLI to return to this VS screen.',
+          ? 'Opens in a window of its own once the turn ends, so doet stays here for the other slot. Nothing is cut short.'
+          : 'Opens in a window of its own; doet takes it back when you close that window.',
+      },
+      {
+        id: 'enter-here',
+        label: 'Enter in this terminal instead',
+        description:
+          'doet steps aside and gives you this terminal. The other slot keeps working but you will not see it, prompts included.',
       },
       {
         id: 'fork',
@@ -574,6 +727,7 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
       onPick: (choice) => {
         setPick(null);
         if (choice === 'enter') void takeOver(slot);
+        else if (choice === 'enter-here') void takeOver(slot, { here: true });
         else if (choice === 'interrupt') void takeOver(slot, { interrupt: true });
         else if (choice === 'fork') void forkOut(slot);
         else if (choice === 'test') void openWorktree(slot);
@@ -590,7 +744,7 @@ export function VsApp({ buses, sides, runner, store, root }: Props) {
       },
     });
     setPickIndex(0);
-  }, [confirmDiscard, discarded, finished, forkOut, mergeConflict, openWorktree, plug, plugged, root, running, sides, takeOver]);
+  }, [confirmDiscard, discarded, finished, forkOut, mergeConflict, openWorktree, outside, plug, plugged, root, running, sides, takeOver]);
 
   const start = useCallback((query: string) => {
     setQuery(query);

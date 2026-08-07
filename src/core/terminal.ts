@@ -34,7 +34,7 @@ const SAFE_TOKEN = /^[A-Za-z0-9_@%+=:,./-]+$/;
  * `codex resume abc-123` and is no safer. A path with a space still gets
  * quoted, because there it does something.
  */
-function shellQuote(value: string): string {
+export function shellQuote(value: string): string {
   if (value.length > 0 && SAFE_TOKEN.test(value)) return value;
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }

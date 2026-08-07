@@ -493,8 +493,13 @@ async function manageWorktrees(cwd: string, action: 'list' | 'prune', force: boo
       ].filter(Boolean).join(' · ');
       process.stdout.write(`  ${worktree.branch}\n    ${worktree.path}\n    ${held || 'nothing to lose'}\n`);
     }
+    // Said here because it is the first thing everyone gets wrong: a worktree
+    // is not a branch waiting to be checked out, it is a checkout already.
     process.stdout.write(
-      '\nDelete the ones holding nothing with `doet --worktrees prune`.\n' +
+      '\nEach path above is already checked out on its branch — `cd` into it and work,\n' +
+        'or open it in your editor. `git checkout` on one of these branches is refused,\n' +
+        'because a branch cannot be checked out in two places at once.\n\n' +
+        'Delete the ones holding nothing with `doet --worktrees prune`.\n' +
         'Add --force to delete the rest too. Branches go with their worktrees.\n',
     );
     return;
@@ -559,7 +564,11 @@ async function runVsMode(args: Args, config: ReturnType<typeof loadConfig>): Pro
    * exclude below keeps `git status` clean so `plug` and the next run still see
    * a clean main tree.
    */
-  const worktreeBase = join(repo.root, '.doet', 'worktrees', store.id);
+  // `mainRoot`, not `root`: starting a run from inside another run's worktree is
+  // fair game, but nesting its worktrees in there would make every generation of
+  // paths longer than the last, and deleting the outer one would silently take
+  // the inner one with it.
+  const worktreeBase = join(repo.mainRoot, '.doet', 'worktrees', store.id);
   await excludeLocally(repo.gitCommonDir, '/.doet/');
   const worktrees: Partial<Record<SlotId, Awaited<ReturnType<typeof addWorktree>>>> = {};
 

@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
@@ -65,8 +65,20 @@ export async function git(cwd: string, args: string[]): Promise<GitResult> {
 // ---------------------------------------------------------------------------
 
 export interface RepoState {
-  /** Absolute path to the top of the working tree. */
+  /** Absolute path to the top of the working tree doet was started in. */
   root: string;
+  /**
+   * The repository's *main* working tree, which is `root` unless doet was
+   * started inside a linked worktree.
+   *
+   * VS runs put their worktrees here rather than in `root`. Starting a run from
+   * inside another run's worktree is a reasonable thing to want — comparing two
+   * ways to carry one agent's branch forward — but if each run nested its
+   * worktrees inside the one it was launched from, the paths would grow without
+   * limit, and deleting an outer worktree would take a later run's work with it.
+   * Every run's worktrees are siblings, whichever tree you start from.
+   */
+  mainRoot: string;
   /** Shared git metadata, writable by linked worktrees for refs and objects. */
   gitCommonDir: string;
   /** Current branch, or null when HEAD is detached. */
@@ -112,9 +124,14 @@ export async function inspectRepo(cwd: string): Promise<RepoState | null> {
     .map((line) => line.slice(3).trim())
     .filter(Boolean);
 
+  const gitCommonDir = resolve(root.stdout, commonDir.stdout);
+
   return {
     root: root.stdout,
-    gitCommonDir: resolve(root.stdout, commonDir.stdout),
+    // The main tree is whatever holds the shared `.git`. A bare repository has
+    // no such tree, so there `root` — a linked worktree of it — has to do.
+    mainRoot: basename(gitCommonDir) === '.git' ? dirname(gitCommonDir) : root.stdout,
+    gitCommonDir,
     // A detached HEAD is a real state, not an error — it just means there is no
     // branch name to merge back into later.
     branch: branch.stdout && branch.stdout !== 'HEAD' ? branch.stdout : null,
