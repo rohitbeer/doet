@@ -4,22 +4,24 @@
   "description": "Run two coding agents on the same task in isolated git worktrees, side by side in real terminals, and compare what they produce.",
   "type": "module",
   "bin": {
-    "doet": "./dist/cli.js"
+    "doet": "./dist/doet.mjs"
   },
-  "main": "./dist/cli.js",
+  "main": "./dist/doet.mjs",
   "files": [
-    "dist"
+    "dist/doet.mjs"
   ],
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "dev": "DOET_HOME=\"$HOME/.doet-dev\" tsx src/cli.tsx",
-    "build": "tsc && chmod +x dist/cli.js",
-    "start": "node dist/cli.js",
+    "build:tsc": "tsc",
+    "bundle": "node scripts/bundle.mjs",
+    "build": "npm run build:tsc && npm run bundle",
+    "start": "node dist/doet.mjs",
     "typecheck": "tsc --noEmit",
-    "prepare": "npm run build",
-    "test": "npm run build && node test/run.mjs"
+    "test": "npm run build && node test/run.mjs",
+    "prepare": "node scripts/prepare.mjs"
   },
   "keywords": [
     "cli",
@@ -37,6 +39,7 @@
   "devDependencies": {
     "@types/node": "^26.1.2",
     "@types/react": "^19.2.18",
+    "esbuild": "^0.25.12",
     "tsx": "^4.23.10",
     "typescript": "^5.9.3"
   },

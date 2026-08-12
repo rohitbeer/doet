@@ -109,19 +109,28 @@ doet you use does not change under you while you are changing it:
 ```bash
 git clone https://github.com/BeerJii/doet.git ~/.doet-src
 cd ~/.doet-src
-npm install       # builds on install, via prepare
 npm link          # puts `doet` on your PATH
 ```
 
-To update, pull and rebuild:
+There is no `npm install` in that list and no build step, because there is
+nothing to fetch and nothing to compile. `dist/doet.mjs` is committed, and
+`ink`, `react` and their trees are compiled into it — one file, no
+`node_modules`, no compiler. A clone is runnable on a machine that has Node and
+nothing else, offline.
+
+To update:
 
 ```bash
-cd ~/.doet-src && git pull && npm install
+cd ~/.doet-src && git pull
 ```
 
-`npm i -g github:BeerJii/doet` does **not** work. npm runs `prepare` in a
-temporary clone that has no devDependencies, so there is no `tsc` to build
-with and the install fails on exit 127.
+`npm link` does not need repeating: it symlinks the bundle, so a pull is the
+whole update.
+
+The trade is that the bundle is generated code kept in git, so it goes stale if
+`src/` changes without it. `npm run build` rebuilds both it and the `tsc`
+output, and it is what `prepare` runs when the dev dependencies are present.
+Commit `dist/doet.mjs` with any change to `src/`.
 
 To work on doet, clone it wherever you keep your work and run it from source
 with `npm run dev`. That reads `~/.doet-dev`, not the `~/.doet` your installed

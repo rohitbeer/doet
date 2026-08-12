@@ -1,7 +1,9 @@
 node_modules/
-dist/
+# The tsc output is a build artefact. The bundle beside it is not: it is the
+# program users run, committed so a clone works with no build and no install.
+dist/*
+!dist/doet.mjs
 *.log
 .DS_Store
 .env
 .env.*
-
