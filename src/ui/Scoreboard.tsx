@@ -3,21 +3,31 @@ import { Box, Text } from 'ink';
 import { formatCost, type SlotScore } from '../core/scoreboard.js';
 import { compactNumber, formatDuration } from '../core/util.js';
 import { AGENT_COLOR, SPINNER } from './theme.js';
-import type { AgentId } from '../core/types.js';
+import type { CliId, SlotId } from '../core/types.js';
 
-/** Rows this band occupies — a title and one line per slot. */
-export const SCOREBOARD_ROWS = 3;
+/** Rows this band occupies — a title, and one line per slot. */
+export function scoreboardRows(slots: number): number {
+  return 1 + slots;
+}
 
 interface Props {
   scores: SlotScore[];
-  agents: Record<'a' | 'b', AgentId>;
-  /** Wall clock for the run: the slower slot, not the sum. */
+  agents: Record<SlotId, CliId>;
+  /** Wall clock for the run: the slowest slot, not the sum. */
   elapsedMs: number;
   finished: boolean;
   width: number;
   spinnerFrame: number;
   /** Files and lines each slot changed, once there is a diff to report. */
-  diffs?: Partial<Record<'a' | 'b', string>>;
+  diffs?: Partial<Record<SlotId, string>>;
+  /**
+   * The slot the keyboard is on, drawn with a marker.
+   *
+   * With two agents you could address one with `tab` and see which from the
+   * header. With nine the scoreboard *is* the list you are choosing from, so
+   * the selection has to be visible on the row itself.
+   */
+  selected?: SlotId | null;
 }
 
 /**
@@ -38,9 +48,10 @@ export function Scoreboard({
   width,
   spinnerFrame,
   diffs,
+  selected,
 }: Props) {
-  // Every row lines up on the same columns, so the two slots can be read as a
-  // comparison instead of two sentences.
+  // Every row lines up on the same columns, so the slots can be read as a
+  // comparison instead of as a list of sentences.
   const labelWidth = Math.max(...scores.map((score) => score.label.length), 1);
 
   return (
@@ -54,7 +65,10 @@ export function Scoreboard({
       </Box>
       {scores.map((score) => (
         <Box key={score.slot} width={width} flexWrap="nowrap" overflow="hidden">
-          <Text color={AGENT_COLOR[agents[score.slot]]} bold>
+          <Text color={selected === score.slot ? 'cyan' : undefined} bold>
+            {selected === score.slot ? '❯' : ' '}
+          </Text>
+          <Text color={AGENT_COLOR[agents[score.slot] ?? 'claude']} bold>
             {score.slot.toUpperCase()}{' '}
           </Text>
           <Text>{score.label.padEnd(labelWidth)} </Text>

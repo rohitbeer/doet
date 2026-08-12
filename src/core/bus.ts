@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import type { AgentId, DoetEvent } from './types.js';
+import type { DoetEvent, SlotId } from './types.js';
 
 /**
  * One typed channel for everything that happens in a session. Adapters publish,
@@ -11,7 +11,7 @@ export class Bus {
   private readonly emitter = new EventEmitter();
 
   constructor() {
-    // Two agents streaming tokens plus a UI and a transcript listener adds up.
+    // Nine agents plus a UI and a transcript listener adds up.
     this.emitter.setMaxListeners(50);
   }
 
@@ -25,7 +25,7 @@ export class Bus {
   }
 
   log(
-    source: AgentId | 'doet',
+    source: SlotId | 'doet',
     message: string,
     level: 'info' | 'warn' | 'error' = 'info',
   ): void {

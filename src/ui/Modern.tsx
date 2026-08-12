@@ -4,9 +4,9 @@ import type { Bus } from '../core/bus.js';
 import type { Conductor } from '../core/conductor.js';
 import type { SessionStore } from '../core/sessions.js';
 import type { TmuxSession } from '../core/tmux.js';
-import { AGENT_LABELS } from '../core/relay.js';
+
 import { compactNumber } from '../core/util.js';
-import { AGENT_IDS, type AgentAdapter, type AgentId, type AgentInfo } from '../core/types.js';
+import type { AgentAdapter, AgentInfo, CliId, SlotId } from '../core/types.js';
 import { Composer } from './Composer.js';
 import { Picker } from './Picker.js';
 import { AGENT_COLOR, SPINNER, THINKING_WORDS } from './theme.js';
@@ -15,7 +15,9 @@ import { isMouseReport, useMouse } from './useMouse.js';
 interface Props {
   bus: Bus;
   conductor: Conductor;
-  agents: Record<AgentId, AgentAdapter>;
+  agents: Record<SlotId, AgentAdapter>;
+  /** The two participants, in the order they were started. */
+  order: SlotId[];
   store: SessionStore;
   session: TmuxSession;
   defaultRounds: number;
@@ -39,9 +41,9 @@ const ROUND_NOTE: Record<number, string> = {
 interface Entry {
   id: number;
   kind: 'user' | 'agent' | 'note';
-  agent?: AgentId;
+  agent?: SlotId;
   /** Who handed this turn over, for the arrow. Absent on the opening turn. */
-  from?: AgentId | 'user';
+  from?: SlotId | 'user';
   text: string;
   tone: 'info' | 'warn' | 'error' | 'good';
 }
@@ -86,7 +88,7 @@ function pad(text: string, width: number): string {
  * are in that session — the real one, with its scrollback and its composer,
  * exactly as if it had been on screen the whole time. `M-0` brings you back.
  */
-export function Modern({ bus, conductor, agents, store, session, defaultRounds }: Props) {
+export function Modern({ bus, conductor, agents, order, store, session, defaultRounds }: Props) {
   const { exit } = useApp();
   const { stdout } = useStdout();
   const [cols, setCols] = useState(stdout.columns ?? 100);
@@ -94,11 +96,10 @@ export function Modern({ bus, conductor, agents, store, session, defaultRounds }
 
   const [input, setInput] = useState('');
   const [entries, setEntries] = useState<Entry[]>([]);
-  const [infos, setInfos] = useState<Record<AgentId, AgentInfo>>({
-    claude: agents.claude.info(),
-    codex: agents.codex.info(),
-  });
-  const [active, setActive] = useState<AgentId | null>(null);
+  const [infos, setInfos] = useState<Record<SlotId, AgentInfo>>(() =>
+    Object.fromEntries(order.map((slot) => [slot, agents[slot]!.info()])),
+  );
+  const [active, setActive] = useState<SlotId | null>(null);
   const [round, setRound] = useState(0);
   const [running, setRunning] = useState(false);
   const [summary, setSummary] = useState('');
@@ -115,13 +116,26 @@ export function Modern({ bus, conductor, agents, store, session, defaultRounds }
   const [cursor, setCursor] = useState<number | null>(null);
 
   const pending = useRef('');
-  const opener = useRef<AgentId>('claude');
+  const opener = useRef<SlotId>(order[0]!);
   const entryId = useRef(0);
   const quitting = useRef(false);
 
   const add = useCallback((entry: Omit<Entry, 'id'>) => {
     setEntries((previous) => [...previous, { ...entry, id: entryId.current++ }].slice(-300));
   }, []);
+
+  /**
+   * What to call a participant, and what colour it is.
+   *
+   * Both go through the slot now rather than the CLI id: co-code can run the
+   * same program on both sides, so "Claude Code" alone stops identifying anyone.
+   * `labelFor` adds the slot prefix only when it has to.
+   */
+  const nameOf = useCallback(
+    (who: SlotId | 'user'): string => (who === 'user' ? 'you' : conductor.labelFor(who)),
+    [conductor],
+  );
+  const cliOf = useCallback((slot: SlotId): CliId => agents[slot]?.cli ?? 'claude', [agents]);
 
   useEffect(() => {
     const onResize = () => {
@@ -159,7 +173,10 @@ export function Modern({ bus, conductor, agents, store, session, defaultRounds }
       case 'turn-end':
       case 'session':
       case 'attention':
-        setInfos((previous) => ({ ...previous, [event.agent]: agents[event.agent].info() }));
+        setInfos((previous) => {
+          const adapter = agents[event.agent];
+          return adapter ? { ...previous, [event.agent]: adapter.info() } : previous;
+        });
         break;
       case 'relay':
         setRound(event.round);
@@ -216,20 +233,20 @@ export function Modern({ bus, conductor, agents, store, session, defaultRounds }
     }
   }), [add, agents, bus]);
 
-  const start = useCallback((query: string, first: AgentId, howMany: number) => {
+  const start = useCallback((query: string, first: SlotId, howMany: number) => {
     setRunning(true);
-    setNotice(`${AGENT_LABELS[first]} answers first · ${howMany} exchange${howMany === 1 ? '' : 's'}`);
+    setNotice(`${nameOf(first)} answers first · ${howMany} exchange${howMany === 1 ? '' : 's'}`);
     setSummary('');
     add({ kind: 'user', text: query, tone: 'info' });
     void conductor.run(query, first, howMany).then((result) => {
       setRunning(false);
-      store.snapshot({ claude: agents.claude.history(), codex: agents.codex.history() });
+      store.snapshot(order.map((slot) => ({ slot, label: conductor.labelFor(slot), markdown: agents[slot]!.history() })));
       add({
         kind: 'note',
-        text: `done — ${result.rounds} exchange${result.rounds === 1 ? '' : 's'}, ${result.reason}. Final answer from ${AGENT_LABELS[result.finalFrom]}.`,
+        text: `done — ${result.rounds} exchange${result.rounds === 1 ? '' : 's'}, ${result.reason}. Final answer from ${nameOf(result.finalFrom)}.`,
         tone: result.reason === 'error' ? 'error' : 'good',
       });
-      setNotice(`Saved in ${store.dir} — the final answer is in ${AGENT_LABELS[result.finalFrom]}'s window.`);
+      setNotice(`Saved in ${store.dir} — the final answer is in ${nameOf(result.finalFrom)}'s window.`);
     }).catch((error: unknown) => {
       setRunning(false);
       setNotice(error instanceof Error ? error.message : String(error));
@@ -237,17 +254,17 @@ export function Modern({ bus, conductor, agents, store, session, defaultRounds }
   }, [add, agents, conductor, store]);
 
   /** Put an agent's real session on screen. */
-  const open = useCallback((id: AgentId) => {
-    const window = infos[id].window;
+  const open = useCallback((id: SlotId) => {
+    const window = infos[id]?.window;
     if (window === undefined) {
-      setNotice(`${AGENT_LABELS[id]} has no window of its own yet.`);
+      setNotice(`${nameOf(id)} has no window of its own yet.`);
       return;
     }
     void session.selectWindow(window);
     // F12 first, and alt second, because Option is not Meta on a stock macOS
     // terminal — `alt+0` quietly does nothing until you turn that on, and a way
     // back that might not work is worse than a duller one that always does.
-    setNotice(`In ${AGENT_LABELS[id]}'s session — F12 (or ctrl+b 0) comes back here.`);
+    setNotice(`In ${nameOf(id)}'s session — F12 (or ctrl+b 0) comes back here.`);
   }, [infos, session]);
 
   const shutdown = useCallback(async () => {
@@ -261,7 +278,7 @@ export function Modern({ bus, conductor, agents, store, session, defaultRounds }
       await conductor.abort();
       await conductor.whenIdle();
     }
-    store.snapshot({ claude: agents.claude.history(), codex: agents.codex.history() });
+    store.snapshot(order.map((slot) => ({ slot, label: conductor.labelFor(slot), markdown: agents[slot]!.history() })));
     store.detach();
     exit();
   }, [agents, conductor, exit, store]);
@@ -396,22 +413,25 @@ export function Modern({ bus, conductor, agents, store, session, defaultRounds }
           read off a live pane at a glance — which model, what it has spent,
           whether it has stopped for you — is here instead. */}
       <Box paddingX={1} width={cols} flexWrap="nowrap" overflow="hidden">
-        {AGENT_IDS.map((id) => (
-          <Box key={id} flexShrink={0} marginRight={2}>
-            <Text color={AGENT_COLOR[id]} bold={active === id}>
-              {active === id ? '▸ ' : '  '}{AGENT_LABELS[id]}
-            </Text>
-            <Text dimColor>
-              {infos[id].window !== undefined ? ` F${infos[id].window}` : ''}
-              {' '}{infos[id].model || 'default'}
-              {infos[id].effort ? `/${infos[id].effort}` : ''}
-              {infos[id].usage.outputTokens != null ? ` · ${compactNumber(infos[id].usage.outputTokens)}` : ''}
-            </Text>
-            {infos[id].attention && (
-              <Text color="yellow" bold> ⚠ {infos[id].attention}</Text>
-            )}
-          </Box>
-        ))}
+        {order.map((id) => {
+          const info = infos[id];
+          return (
+            <Box key={id} flexShrink={0} marginRight={2}>
+              <Text color={AGENT_COLOR[cliOf(id)]} bold={active === id}>
+                {active === id ? '▸ ' : '  '}{nameOf(id)}
+              </Text>
+              <Text dimColor>
+                {info?.window !== undefined ? ` F${info.window}` : ''}
+                {' '}{info?.model || 'default'}
+                {info?.effort ? `/${info.effort}` : ''}
+                {info?.usage.outputTokens != null ? ` · ${compactNumber(info.usage.outputTokens)}` : ''}
+              </Text>
+              {info?.attention && (
+                <Text color="yellow" bold> ⚠ {info.attention}</Text>
+              )}
+            </Box>
+          );
+        })}
       </Box>
 
       <Box paddingX={1} width={cols}>
@@ -441,12 +461,12 @@ export function Modern({ bus, conductor, agents, store, session, defaultRounds }
           const working = running && active === id && !entry.text;
           return (
             <Text key={entry.id} wrap="truncate-end">
-              <Text color={AGENT_COLOR[id]} bold={selected}>
+              <Text color={AGENT_COLOR[cliOf(id)]} bold={selected}>
                 {selected ? '▾ ' : '  '}
-                {pad(AGENT_LABELS[id], NAME_WIDTH - 2)}
+                {pad(nameOf(id), NAME_WIDTH - 2)}
               </Text>
               <Text dimColor>
-                {pad(entry.from ? `◀── ${entry.from === 'user' ? 'you' : AGENT_LABELS[entry.from]}` : '', ARROW_WIDTH)}
+                {pad(entry.from ? `◀── ${entry.from === 'user' ? 'you' : nameOf(entry.from)}` : '', ARROW_WIDTH)}
               </Text>
               {working ? (
                 <Text color="yellow">
@@ -465,7 +485,7 @@ export function Modern({ bus, conductor, agents, store, session, defaultRounds }
       {choosing === 'rounds' && (
         <Box paddingX={1}>
           <Picker
-            title={`How many exchanges? — ${AGENT_LABELS[opener.current]} answers first`}
+            title={`How many exchanges? — ${nameOf(opener.current)} answers first`}
             items={ROUND_CHOICES.map((n) => ({
               id: String(n),
               label: n === 1 ? 'Just one answer' : `${n} exchanges`,
@@ -489,8 +509,13 @@ export function Modern({ bus, conductor, agents, store, session, defaultRounds }
       <Composer
         value={input}
         choosingFirst={choosing === 'first'}
+        openers={order.map((slot, index) => ({
+          key: String(index + 1),
+          label: conductor.labelFor(slot),
+          cli: cliOf(slot),
+        }))}
         phase={running ? 'exchanging' : 'idle'}
-        active={active}
+        active={active ? cliOf(active) : null}
         width={cols}
         hint={
           running

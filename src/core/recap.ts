@@ -3,8 +3,9 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Bus } from './bus.js';
-import { claudeProjectDir } from './journal.js';
-import type { AgentId } from './types.js';
+import { claudeProjectDir } from './agents/claude.js';
+import { cliFor } from './agents/registry.js';
+import type { CliId, SlotId } from './types.js';
 
 /**
  * The one-line account of a turn, written by the agent that took it.
@@ -101,68 +102,15 @@ ${said}
 }
 
 /**
- * The argv that answers one question and exits.
+ * Which of the two questions this agent gets.
  *
- * `lastMessage` is a path Codex is asked to write its final message to.
- * `codex exec` narrates itself on stdout — a banner, the model, its reasoning —
- * so stdout is a transcript rather than an answer, and squeezing that into one
- * line would print the banner instead of the summary. Claude's `--print` writes
- * the answer alone, so it needs nothing of the sort.
+ * An agent that can be forked is answering about a session it lived through, so
+ * it is asked what it *did*. One that cannot is being handed its own words and
+ * nothing else, so it is asked what was *in them* — a weaker question, and the
+ * only honest one to put to an agent with no memory of the work.
  */
-function argv(opts: {
-  agent: AgentId;
-  sessionId: string;
-  scope: RecapScope;
-  said: string;
-  lastMessage: string;
-}): { command: string; args: string[] } {
-  if (opts.agent === 'claude') {
-    return {
-      command: 'claude',
-      args: [
-        '--resume', opts.sessionId,
-        // Branch the conversation rather than continuing it: this question is
-        // doet's, and it must not become a turn the agent remembers taking.
-        '--fork-session',
-        '--print',
-        // Reading its own transcript needs no tools, and a summariser that
-        // could run commands is a summariser that can raise a prompt nobody is
-        // watching for.
-        '--permission-mode', 'plan',
-        '--disallowed-tools', 'Bash,Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch,Task',
-        // Asking for JSON is what makes the fork disposable rather than merely
-        // findable: the answer comes back with the id of the session it was
-        // written in, so the copy is deleted by name instead of by guessing
-        // which file appeared while doet was not looking.
-        '--output-format', 'json',
-        // `--disallowed-tools <tools...>` is variadic, so without this it eats
-        // the prompt: every word of it is read as another tool to deny, the
-        // prompt arrives empty, and Claude sits waiting on stdin for one. It
-        // fails as "Permission deny rule \"heading\" matches no known tool",
-        // which does not sound like the prompt going missing, but is.
-        '--',
-        forkPrompt(opts.scope),
-      ],
-    };
-  }
-  return {
-    command: 'codex',
-    args: [
-      'exec',
-      // No session on disk and none in the thread store: this is one question
-      // about text doet already has, and it must leave nothing behind that a
-      // later `resume` could walk into.
-      '--ephemeral',
-      '--skip-git-repo-check',
-      // `codex exec` takes `--sandbox`, `codex exec resume` does not, and the
-      // config override is the same setting by its real name. Not decoration: a
-      // summariser nobody is watching must not be able to run anything, or ask.
-      '-c', 'sandbox_mode="read-only"',
-      '-c', 'approval_policy="never"',
-      '--output-last-message', opts.lastMessage,
-      oneShotPrompt(opts.scope, opts.said),
-    ],
-  };
+function promptFor(cli: CliId, scope: RecapScope, said: string): string {
+  return cliFor(cli).supports.fork ? forkPrompt(scope) : oneShotPrompt(scope, said);
 }
 
 /**
@@ -174,57 +122,78 @@ function argv(opts: {
  */
 export async function recap(opts: {
   bus: Bus;
-  agent: AgentId;
+  /** Whose voice the line is in, and whose pane any warning goes to. */
+  slot: SlotId;
+  cli: CliId;
   sessionId: string;
   cwd: string;
   scope: RecapScope;
-  /** What the agent wrote. Only Codex needs it — Claude's fork was there. */
+  /** What the agent wrote. Only needed by the ones that cannot be forked. */
   said?: string;
 }): Promise<string | null> {
-  const { bus, agent, sessionId, cwd, scope } = opts;
+  const { bus, slot, cli, sessionId, cwd, scope } = opts;
+  const definition = cliFor(cli);
   const said = (opts.said ?? '').trim();
-  if (agent === 'codex' && !said) return null;
+  // An agent that cannot be forked has nothing to describe but the text it is
+  // handed, so with no text there is no question worth asking.
+  if (!definition.supports.fork && !said) return null;
 
-  // Claude's fork is a real session on disk. Note what is there first so the
-  // copy can be removed afterwards rather than left behind for every exchange
-  // of every run.
-  const before = agent === 'claude' ? listSessions(cwd) : new Set<string>();
-  const scratch = agent === 'codex' ? mkdtempSync(join(tmpdir(), 'doet-recap-')) : null;
-  const lastMessage = scratch ? join(scratch, 'message.txt') : '';
-  const { command, args } = argv({ agent, sessionId, scope, said, lastMessage });
+  const scratch = mkdtempSync(join(tmpdir(), 'doet-recap-'));
+  const lastMessagePath = join(scratch, 'message.txt');
+  const plan = definition.recap({
+    sessionId,
+    cwd,
+    prompt: promptFor(cli, scope, said),
+    lastMessagePath,
+  });
+  // Null is a real answer: this CLI has no way to be asked that would not
+  // disturb the session it is describing. See each definition's `recap`.
+  if (!plan) {
+    rmSync(scratch, { recursive: true, force: true });
+    return null;
+  }
+
+  // A fork that lands as a file on disk has to be swept up afterwards. Note
+  // what is there first, so the copy can be removed by difference rather than
+  // left behind for every exchange of every run.
+  const before = plan.leavesFork ? listSessions(cwd) : new Set<string>();
 
   let fork: string | undefined;
   try {
     const text = await new Promise<string>((resolve) => {
       const child = execFile(
-        command,
-        args,
+        plan.command,
+        plan.args,
         { cwd, timeout: RECAP_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 },
         (error, stdout) => {
           if (error && !stdout.trim()) {
-            bus.log(agent, `Could not summarise: ${error.message}`, 'warn');
+            bus.log(slot, `Could not summarise: ${error.message}`, 'warn');
             resolve('');
             return;
           }
-          if (agent === 'claude') {
+          if (plan.read === 'json') {
             const answer = readClaudeResult(stdout);
             // The id first: a run that failed still forked, and the copy has to
             // go whether or not there is anything to show for it.
             fork = answer.session;
             if (answer.failed) {
-              bus.log(agent, `Could not summarise: ${answer.text || 'the CLI reported an error'}`, 'warn');
+              bus.log(slot, `Could not summarise: ${answer.text || 'the CLI reported an error'}`, 'warn');
               resolve('');
               return;
             }
             resolve(answer.text);
             return;
           }
-          // Codex's own file first; its stdout is the fallback, and only
-          // because an answer buried in narration still beats no answer.
-          resolve(readLastMessage(lastMessage) || stdout.trim());
+          if (plan.read === 'file') {
+            // The CLI's own file first; its stdout is the fallback, and only
+            // because an answer buried in narration still beats no answer.
+            resolve(readLastMessage(lastMessagePath) || stdout.trim());
+            return;
+          }
+          resolve(stdout.trim());
         },
       );
-      // Nothing is being sent, so say so by closing it. Both CLIs read stdin
+      // Nothing is being sent, so say so by closing it. These CLIs read stdin
       // for a prompt even when given one on the command line: Claude waits
       // three seconds and says so ("no stdin data received in 3s, proceeding
       // without it"), Codex waits for as long as you let it — which out here
@@ -234,8 +203,8 @@ export async function recap(opts: {
     const tidied = scope === 'exchange' ? oneLine(text) : text.trim();
     return tidied || null;
   } finally {
-    if (scratch) rmSync(scratch, { recursive: true, force: true });
-    if (agent === 'claude') await discardFork(cwd, fork, before, bus);
+    rmSync(scratch, { recursive: true, force: true });
+    if (plan.leavesFork) await discardFork(cwd, fork, before, bus);
   }
 }
 

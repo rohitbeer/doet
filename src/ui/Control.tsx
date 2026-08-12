@@ -6,7 +6,7 @@ import type { PricingTable } from '../core/pricing.js';
 import { elapsedFor, scoreSlot, type SlotScore } from '../core/scoreboard.js';
 import type { SessionStore } from '../core/sessions.js';
 import type { TmuxSession } from '../core/tmux.js';
-import { SLOT_IDS, type AgentInfo, type SlotId, type VsResult } from '../core/types.js';
+import type { AgentInfo, CliId, SlotId, VsResult } from '../core/types.js';
 import type { VsRunner, VsSide } from '../core/vs.js';
 import { Composer } from './Composer.js';
 import { Scoreboard } from './Scoreboard.js';
@@ -15,6 +15,7 @@ import { AGENT_COLOR, SPINNER } from './theme.js';
 interface Props {
   buses: Record<SlotId, Bus>;
   sides: Record<SlotId, VsSide>;
+  order: SlotId[];
   runner: VsRunner;
   store: SessionStore;
   session: TmuxSession;
@@ -37,20 +38,35 @@ const TONE_COLOR: Record<Note['tone'], string | undefined> = {
 };
 
 /**
- * doet's own pane.
+ * doet's own screen in a VS run — the dashboard.
  *
- * There used to be two of these, each around fourteen hundred lines, and almost
- * all of it was spent redrawing the agents: wrapping their prose, colouring
- * their tool calls, tracking scrollback, arbitrating a permission prompt. None
- * of that is here, because none of it is doet's job any more — each agent
- * renders itself in its own tmux pane, far better than this ever did.
+ * It used to be a narrow pane wedged between two agents. That worked for two
+ * and stops working at three: five agents tiled beside doet gets every one of
+ * them about fifteen columns, which is not a coding agent, it is a column of
+ * broken words.
  *
- * What is left is the part that was always doet's: what the run has spent,
- * where the branches are, and one place to type.
+ * So VS borrows co-code's modern arrangement. Each agent has a tmux window to
+ * itself, running at the full width of your terminal whether or not you are
+ * looking at it, and this takes the whole screen: a row per agent with what it
+ * has spent and what its branch holds. You move down the list with the arrow
+ * keys and open the one you want.
+ *
+ * Two keys do the things you actually want from a list like this:
+ *
+ *   enter — go to that agent's window and watch it work.
+ *   w     — open its *worktree* in a new window, with its session forked, so
+ *           you can pick up where it got to without touching the run.
+ *
+ * The second is the one that needed the CLI work behind it. A fork is a copy of
+ * the conversation, not a second client on it: the agent carries on undisturbed
+ * in its own window while you have the whole of its context in yours. Claude and
+ * kilo can do it; Codex and cline cannot, and say so rather than quietly
+ * resuming the live session and corrupting it.
  */
 export function Control({
   buses,
   sides,
+  order,
   runner,
   store,
   session,
@@ -64,17 +80,21 @@ export function Control({
 
   const [input, setInput] = useState('');
   const [notes, setNotes] = useState<Note[]>([]);
-  const [infos, setInfos] = useState<Record<SlotId, AgentInfo>>({
-    a: sides.a.adapter.info(),
-    b: sides.b.adapter.info(),
-  });
+  const [infos, setInfos] = useState<Record<SlotId, AgentInfo>>(() =>
+    Object.fromEntries(order.map((slot) => [slot, sides[slot]!.adapter.info()])),
+  );
   const [running, setRunning] = useState(false);
-  const [runningSlot, setRunningSlot] = useState<SlotId | null>(null);
+  const [runningSlots, setRunningSlots] = useState<SlotId[]>([]);
   const [finished, setFinished] = useState<VsResult | null>(null);
-  const [notice, setNotice] = useState('Type a request — both slots get it, in their own worktrees.');
+  const [notice, setNotice] = useState(
+    `Type a request — all ${order.length} agents get it, each in its own worktree.`,
+  );
   const [spinner, setSpinner] = useState(0);
+  /** Where the keyboard is. Never null: with a list, something is always current. */
+  const [cursor, setCursor] = useState<SlotId>(order[0]!);
+  /** Set when enter should address one agent rather than all of them. */
   const [target, setTarget] = useState<SlotId | null>(null);
-  const [plugged, setPlugged] = useState<Record<SlotId, boolean>>({ a: false, b: false });
+  const [plugged, setPlugged] = useState<Record<SlotId, boolean>>({});
   const [mergeConflict, setMergeConflict] = useState(false);
 
   const noteId = useRef(0);
@@ -85,7 +105,9 @@ export function Control({
   }, []);
 
   const refreshInfo = useCallback((slot: SlotId) => {
-    setInfos((previous) => ({ ...previous, [slot]: sides[slot].adapter.info() }));
+    const side = sides[slot];
+    if (!side) return;
+    setInfos((previous) => ({ ...previous, [slot]: side.adapter.info() }));
   }, [sides]);
 
   useEffect(() => {
@@ -105,52 +127,58 @@ export function Control({
     return () => clearInterval(timer);
   }, []);
 
-  // Only doet's own events reach here now — status, usage, errors and notes.
-  // The agents' prose and tool calls never enter this process at all.
+  // Only doet's own events reach here — status, usage, errors and notes. The
+  // agents' prose and tool calls never enter this process at all.
   useEffect(() => {
-    const off = SLOT_IDS.map((slot) => buses[slot].on((event) => {
+    const off = order.map((slot) => buses[slot]!.on((event) => {
       switch (event.kind) {
         case 'status':
         case 'usage':
         case 'session':
         case 'turn-end':
+        case 'attention':
           refreshInfo(slot);
           break;
         case 'error':
           say(`${slot.toUpperCase()}: ${event.message}`, 'error');
           break;
         case 'log':
-          say(`${slot.toUpperCase()}: ${event.message}`, event.level === 'error' ? 'error' : event.level === 'warn' ? 'warn' : 'info');
+          say(
+            `${slot.toUpperCase()}: ${event.message}`,
+            event.level === 'error' ? 'error' : event.level === 'warn' ? 'warn' : 'info',
+          );
           break;
         default:
           break;
       }
     }));
     return () => off.forEach((unsubscribe) => unsubscribe());
-  }, [buses, refreshInfo, say]);
+  }, [buses, order, refreshInfo, say]);
 
   useEffect(() => {
-    for (const slot of SLOT_IDS) {
-      say(`${slot.toUpperCase()} → ${sides[slot].worktree.branch}`, 'info');
+    for (const slot of order) {
+      say(`${slot.toUpperCase()} → ${sides[slot]!.worktree.branch}`, 'info');
     }
-  }, [say, sides]);
+  }, [order, say, sides]);
 
   const start = useCallback((query: string) => {
-    const unavailable = SLOT_IDS.filter((slot) => plugged[slot]);
+    const unavailable = order.filter((slot) => plugged[slot]);
     if (unavailable.length > 0) {
       setNotice(
-        `Slot ${unavailable.map((s) => s.toUpperCase()).join(' and ')} already moved into the main tree, so there is nothing isolated left to compare.`,
+        `${unavailable.map((s) => s.toUpperCase()).join(', ')} already moved into the main tree, so there is nothing isolated left to compare.`,
       );
       return;
     }
     setRunning(true);
-    setRunningSlot(null);
-    setNotice('Both slots are working — watch their panes.');
+    setRunningSlots(order);
+    setNotice(`All ${order.length} agents are working — enter opens the one you are on.`);
     void runner.run(query).then((result) => {
       setFinished(result);
       setRunning(false);
-      for (const slot of SLOT_IDS) {
+      setRunningSlots([]);
+      for (const slot of result.order) {
         const side = result.slots[slot];
+        if (!side) continue;
         say(
           side.error
             ? `${slot.toUpperCase()} failed: ${side.error}`
@@ -159,12 +187,13 @@ export function Control({
         );
         refreshInfo(slot);
       }
-      setNotice(`Saved in ${store.dir} · a/b plugs a slot into main · tab targets one slot`);
+      setNotice(`Saved in ${store.dir} · p plugs the selected agent into main`);
     }).catch((error: unknown) => {
       setRunning(false);
+      setRunningSlots([]);
       setNotice(error instanceof Error ? error.message : String(error));
     });
-  }, [plugged, refreshInfo, runner, say, store.dir]);
+  }, [order, plugged, refreshInfo, runner, say, store.dir]);
 
   const sendTo = useCallback(async (slot: SlotId, text: string) => {
     try {
@@ -172,17 +201,18 @@ export function Control({
       say(`→ ${slot.toUpperCase()} (${delivery === 'live' ? 'added mid-turn' : 'its own turn'})`, 'info');
       if (!turn) return;
       setRunning(true);
-      setRunningSlot(slot);
+      setRunningSlots((current) => (current.includes(slot) ? current : [...current, slot]));
       await turn.catch(() => undefined);
       setRunning(runner.isRunning);
-      setRunningSlot((current) => (current === slot ? null : current));
+      setRunningSlots((current) => current.filter((id) => id !== slot));
       refreshInfo(slot);
       const diff = await runner.diffFor(slot).catch(() => null);
       if (diff) {
-        setFinished((current) => current && ({
-          ...current,
-          slots: { ...current.slots, [slot]: { ...current.slots[slot], ...diff } },
-        }));
+        setFinished((current) => {
+          const side = current?.slots[slot];
+          if (!current || !side) return current;
+          return { ...current, slots: { ...current.slots, [slot]: { ...side, ...diff } } };
+        });
       }
       say(`${slot.toUpperCase()} finished — its branch has the change.`, 'good');
     } catch (error) {
@@ -190,9 +220,56 @@ export function Control({
     }
   }, [refreshInfo, runner, say]);
 
-  /** Squash one slot's branch into the main tree and keep working there. */
+  /** Go and watch this agent work, in the window it has to itself. */
+  const openAgent = useCallback(async (slot: SlotId) => {
+    const window = infos[slot]?.window;
+    if (window === undefined) {
+      setNotice(`Slot ${slot.toUpperCase()} has no window of its own yet.`);
+      return;
+    }
+    await session.selectWindow(window);
+  }, [infos, session]);
+
+  /**
+   * Open this agent's worktree with its session forked into it.
+   *
+   * The point of the fork is that the run carries on. You get a session that has
+   * read everything that agent read and made everything it made, in the same
+   * checkout, and nothing you do in it lands in the comparison.
+   */
+  const openWorktree = useCallback(async (slot: SlotId) => {
+    const side = sides[slot];
+    if (!side) return;
+    try {
+      const fork = await side.adapter.forkSession();
+      if (!fork) {
+        const info = infos[slot];
+        setNotice(
+          info?.sessionId
+            ? `${info.label} cannot fork a session, so doet will not open one — it would be a second client on the session that agent is still working in.`
+            : `Slot ${slot.toUpperCase()} has no session yet. Send a request first.`,
+        );
+        return;
+      }
+      const placed = await session.newWindow({
+        title: `${slot.toUpperCase()} · worktree · ${side.worktree.branch}  —  F12 back to doet`,
+        name: `${slot}-tree`,
+        cwd: side.worktree.path,
+        command: fork.command,
+        args: fork.args,
+      });
+      await session.selectWindow(placed.window);
+      store.appendNote(`Opened slot ${slot.toUpperCase()}'s worktree on a fork of its session.`);
+      say(`${slot.toUpperCase()} — forked into ${side.worktree.path}`, 'good');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : String(error));
+    }
+  }, [infos, say, session, sides, store]);
+
+  /** Squash one agent's branch into the main tree and keep working there. */
   const plug = useCallback(async (slot: SlotId) => {
     const side = sides[slot];
+    if (!side) return;
     try {
       if (running) {
         setNotice('Wait for the current turn to finish first.');
@@ -216,10 +293,9 @@ export function Control({
         return;
       }
       const commit = await commitAll(root, `doet vs: plug slot ${slot} (${side.cli})`);
-      // Restarts that CLI in the main tree on the same session, so the pane you
-      // were reading carries on where it was.
+      // Restarts that CLI in the main tree on the same session, so the window
+      // you were reading carries on where it was.
       await side.adapter.setCwd(root);
-      await session.tile();
       refreshInfo(slot);
       setMergeConflict(false);
       setPlugged((current) => ({ ...current, [slot]: true }));
@@ -227,12 +303,12 @@ export function Control({
       store.appendNote(
         `Plugged slot ${slot.toUpperCase()} into main${commit.changed ? ` as ${commit.sha.slice(0, 12)}` : ''}.`,
       );
-      say(`${slot.toUpperCase()} plugged into main — its pane is now on the main tree.`, 'good');
+      say(`${slot.toUpperCase()} plugged into main — it is now on the main tree.`, 'good');
       setNotice(`Typing now continues slot ${slot.toUpperCase()} in the main tree.`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : String(error));
     }
-  }, [refreshInfo, root, running, say, session, sides, store]);
+  }, [refreshInfo, root, running, say, sides, store]);
 
   const shutdown = useCallback(async () => {
     if (quitting.current) {
@@ -246,13 +322,31 @@ export function Control({
     exit();
   }, [exit, runner, store]);
 
+  const move = useCallback((delta: number) => {
+    setCursor((current) => {
+      const index = order.indexOf(current);
+      const next = (index + delta + order.length) % order.length;
+      return order[next]!;
+    });
+  }, [order]);
+
   useInput((char, key) => {
     if (key.ctrl && char === 'c') {
       void shutdown();
       return;
     }
+    if (key.upArrow) {
+      move(-1);
+      return;
+    }
+    if (key.downArrow) {
+      move(1);
+      return;
+    }
     if (key.tab) {
-      setTarget((current) => (current === null ? 'a' : current === 'a' ? 'b' : null));
+      // Addresses the agent the cursor is on, or clears the address if it is
+      // already the one being addressed.
+      setTarget((current) => (current === cursor ? null : cursor));
       return;
     }
     if (key.escape) {
@@ -262,10 +356,15 @@ export function Control({
     }
     if (key.return) {
       const text = input.trim();
-      if (!text) return;
+      // Enter on an empty composer is "show me this one", which is the thing you
+      // want most often from a list of agents you cannot see.
+      if (!text) {
+        void openAgent(cursor);
+        return;
+      }
       setInput('');
       if (target) void sendTo(target, text);
-      else if (running) setNotice('A run is in flight — tab to target one slot, or esc to stop.');
+      else if (running) setNotice('A run is in flight — tab to address one agent, or esc to stop.');
       else start(text);
       return;
     }
@@ -273,12 +372,15 @@ export function Control({
       setInput((value) => value.slice(0, -1));
       return;
     }
-    // Actions only make sense once there is something to act on, and only when
-    // the composer is empty — otherwise every `a` typed into a prompt would
-    // plug a branch into the main tree.
-    if (!input && finished && !running) {
-      if (char === 'a' || char === 'b') {
-        void plug(char);
+    // Letter actions only when the composer is empty, or every `w` typed into a
+    // request would open a worktree.
+    if (!input) {
+      if (char === 'w') {
+        void openWorktree(cursor);
+        return;
+      }
+      if (char === 'p' && finished && !running) {
+        void plug(cursor);
         return;
       }
       if (char === 'x' && mergeConflict) {
@@ -293,52 +395,60 @@ export function Control({
   });
 
   const now = Date.now();
-  const stats = { a: runner.statsFor('a'), b: runner.statsFor('b') };
-  const scores: SlotScore[] = SLOT_IDS.map((slot) => scoreSlot({
+  const stats = useMemo(
+    () => Object.fromEntries(order.map((slot) => [slot, runner.statsFor(slot)])),
+    // Recomputed every frame on purpose: the counters are live while a run is in
+    // flight, and the spinner tick is what drives the redraw.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [order, runner, spinner],
+  );
+  const scores: SlotScore[] = order.map((slot) => scoreSlot({
     slot,
-    label: infos[slot].label,
-    model: infos[slot].model,
-    stats: stats[slot],
+    label: infos[slot]?.label ?? slot.toUpperCase(),
+    model: infos[slot]?.model ?? '',
+    stats: stats[slot]!,
     pricing,
     now,
   }));
-  const wallClock = Math.max(...SLOT_IDS.map((slot) => elapsedFor(stats[slot], now)));
+  const wallClock = Math.max(0, ...order.map((slot) => elapsedFor(stats[slot]!, now)));
+  const agents: Record<SlotId, CliId> = Object.fromEntries(
+    order.map((slot) => [slot, sides[slot]!.cli]),
+  );
   const diffs: Partial<Record<SlotId, string>> = finished
-    ? {
-        a: `${finished.slots.a.files}f +${finished.slots.a.insertions} −${finished.slots.a.deletions}`,
-        b: `${finished.slots.b.files}f +${finished.slots.b.insertions} −${finished.slots.b.deletions}`,
-      }
+    ? Object.fromEntries(order.flatMap((slot) => {
+        const side = finished.slots[slot];
+        return side ? [[slot, `${side.files}f +${side.insertions} −${side.deletions}`]] : [];
+      }))
     : {};
 
   const started = running || finished !== null;
-  // This pane is short by design — the agents get the height. Everything below
-  // the scoreboard shares what is left, newest last.
-  const chrome = 1 /* header */ + (started ? 3 : 0) + 4 /* composer */;
+  const chrome = 1 /* header */ + (started ? 1 + order.length : 0) + 4 /* composer */;
   const noteRows = Math.max(1, rows - chrome);
   const visible = notes.slice(-noteRows);
 
-  const summary = useMemo(
-    () => running
-      ? runningSlot ? `slot ${runningSlot.toUpperCase()} working` : 'both slots working'
-      : finished ? 'branches ready' : 'ready',
-    [finished, running, runningSlot],
-  );
+  const summary = useMemo(() => {
+    if (running) {
+      return runningSlots.length === order.length
+        ? `all ${order.length} working`
+        : `${runningSlots.map((slot) => slot.toUpperCase()).join(', ')} working`;
+    }
+    return finished ? 'branches ready' : 'ready';
+  }, [finished, order.length, running, runningSlots]);
+
+  const waiting = order.filter((slot) => infos[slot]?.attention);
 
   return (
     <Box flexDirection="column" width={cols} height={rows}>
       <Box paddingX={1} width={cols} flexWrap="nowrap" overflow="hidden">
         <Box flexShrink={0}>
           <Text bold>doet · vs</Text>
+          <Text dimColor> · {order.length} agents</Text>
           {target && (
-            <Text color={AGENT_COLOR[sides[target].cli]} bold>
+            <Text color={AGENT_COLOR[sides[target]!.cli]} bold>
               {' '}→ {target.toUpperCase()}
             </Text>
           )}
         </Box>
-        {/* The spacer collapses to nothing in a narrow pane — doet's own pane
-            is deliberately the small one — so the separator has to be a real
-            character rather than a gap, or the title runs straight into the
-            status ("doet · vsready"). */}
         <Box flexGrow={1} />
         <Box flexShrink={0}>
           <Text dimColor> · </Text>
@@ -351,16 +461,25 @@ export function Control({
       </Box>
 
       {started && (
-        <Box paddingX={1} height={3} overflow="hidden">
+        <Box paddingX={1} height={1 + order.length} overflow="hidden">
           <Scoreboard
             scores={scores}
-            agents={{ a: sides.a.cli, b: sides.b.cli }}
+            agents={agents}
             elapsedMs={wallClock}
             finished={!running}
             width={cols - 2}
             spinnerFrame={spinner}
             diffs={diffs}
+            selected={cursor}
           />
+        </Box>
+      )}
+
+      {waiting.length > 0 && (
+        <Box paddingX={1}>
+          <Text color="yellow">
+            {waiting.map((slot) => `${slot.toUpperCase()} ${infos[slot]?.attention}`).join(' · ')}
+          </Text>
         </Box>
       )}
 
@@ -376,17 +495,16 @@ export function Control({
         value={input}
         choosingFirst={false}
         phase={running ? 'exchanging' : finished ? 'done' : 'idle'}
-        active={running ? sides[runningSlot ?? 'a'].cli : null}
+        active={running ? (sides[runningSlots[0] ?? order[0]!]?.cli ?? null) : null}
         width={cols}
         hint={
           target
-            ? `enter sends to slot ${target.toUpperCase()} alone · tab cycles · esc clears the target`
-            : running
-              ? 'tab to target one slot · esc stops both · agents are in their own panes'
-              : finished
-                ? 'type for another round · tab targets one slot · a/b plugs into main' +
-                  (mergeConflict ? ' · x aborts the merge' : '')
-                : 'type one request · enter sends it to both slots'
+            ? `enter sends to ${target.toUpperCase()} alone · tab clears it · ↑↓ moves`
+            : input
+              ? 'enter sends to every agent · tab addresses the selected one'
+              : `↑↓ select · enter opens ${cursor.toUpperCase()} · w opens its worktree (forked)` +
+                (finished && !running ? ' · p plugs it into main' : '') +
+                (mergeConflict ? ' · x aborts the merge' : '')
         }
       />
     </Box>

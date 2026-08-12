@@ -1,13 +1,11 @@
 import type { Bus } from './bus.js';
 import { Deferred } from './util.js';
 import type { SessionStore } from './sessions.js';
-import { AGENT_LABELS } from './relay.js';
 import { recap } from './recap.js';
 import {
-  otherAgent,
   type AgentAdapter,
-  type AgentId,
   type DebatePhase,
+  type SlotId,
   type TurnResult,
 } from './types.js';
 
@@ -23,12 +21,12 @@ export interface DebateResult {
   rounds: number;
   reason: 'exhausted' | 'stopped' | 'error';
   final: string;
-  finalFrom: AgentId;
+  finalFrom: SlotId;
 }
 
 interface Exchange {
   round: number;
-  agent: AgentId;
+  agent: SlotId;
   text: string;
 }
 
@@ -49,7 +47,9 @@ interface Exchange {
  */
 export class Conductor {
   private readonly bus: Bus;
-  private readonly agents: Record<AgentId, AgentAdapter>;
+  private readonly agents: Record<SlotId, AgentAdapter>;
+  /** The two participants, in the order they sit on screen. */
+  private readonly order: SlotId[];
   private readonly store: SessionStore;
   private config: DebateConfig;
 
@@ -57,24 +57,61 @@ export class Conductor {
   private round = 0;
   private query = '';
   private readonly exchanges: Exchange[] = [];
-  /** Agents that have already been told what the human asked. */
-  private readonly greeted = new Set<AgentId>();
+  /** Slots that have already been told what the human asked. */
+  private readonly greeted = new Set<SlotId>();
   private stopRequested = false;
   private inflight: Deferred<void> | null = null;
-  private active: AgentId | null = null;
+  private active: SlotId | null = null;
   /** Text the user typed mid-session, delivered before the next relay. */
   private interjections: string[] = [];
 
   constructor(opts: {
     bus: Bus;
-    agents: Record<AgentId, AgentAdapter>;
+    agents: Record<SlotId, AgentAdapter>;
+    order: SlotId[];
     store: SessionStore;
     config?: DebateConfig;
   }) {
     this.bus = opts.bus;
     this.agents = opts.agents;
+    this.order = [...opts.order];
+    if (this.order.length !== 2) {
+      // co-code is a conversation between two, and always has been: they share
+      // one working tree and take turns so that neither is editing while the
+      // other is. Three would need a turn order nobody has asked for and a tree
+      // nobody could hold. VS is the mode that scales.
+      throw new Error(`co-code runs exactly two agents, not ${this.order.length}.`);
+    }
     this.store = opts.store;
     this.config = opts.config ?? DEFAULT_DEBATE;
+  }
+
+  private adapter(slot: SlotId): AgentAdapter {
+    const adapter = this.agents[slot];
+    if (!adapter) throw new Error(`There is no slot ${slot.toUpperCase()} in this session.`);
+    return adapter;
+  }
+
+  /**
+   * What to call this participant.
+   *
+   * Qualified by slot only when it has to be. "Claude Code" reads better than
+   * "A · Claude Code" — but co-code can now be Claude against Claude, and two
+   * identical names in a relay log is worse than a prefix on both.
+   */
+  labelFor(slot: SlotId): string {
+    const label = this.adapter(slot).label;
+    const shared = this.order.some((other) => other !== slot && this.adapter(other).label === label);
+    return shared ? `${slot.toUpperCase()} · ${label}` : label;
+  }
+
+  /** The one whose turn it is not. */
+  private other(slot: SlotId): SlotId {
+    return this.order.find((candidate) => candidate !== slot) ?? slot;
+  }
+
+  get participants(): SlotId[] {
+    return [...this.order];
   }
 
   get currentQuery(): string {
@@ -89,7 +126,7 @@ export class Conductor {
     return this.round;
   }
 
-  get activeAgent(): AgentId | null {
+  get activeAgent(): SlotId | null {
     return this.active;
   }
 
@@ -149,7 +186,7 @@ export class Conductor {
   async abort(): Promise<void> {
     if (!this.isRunning) return;
     this.stopRequested = true;
-    if (this.active) await this.agents[this.active].interrupt();
+    if (this.active) await this.adapter(this.active).interrupt();
   }
 
   async whenIdle(): Promise<void> {
@@ -168,7 +205,7 @@ export class Conductor {
     this.bus.log('doet', 'Your note will reach the next agent before its turn.');
   }
 
-  async run(query: string, first: AgentId, rounds?: number): Promise<DebateResult> {
+  async run(query: string, first: SlotId, rounds?: number): Promise<DebateResult> {
     this.inflight = new Deferred<void>();
     if (rounds && rounds > 0) this.config = { ...this.config, maxRounds: rounds };
     try {
@@ -180,7 +217,7 @@ export class Conductor {
     }
   }
 
-  private async exchange(query: string, first: AgentId): Promise<DebateResult> {
+  private async exchange(query: string, first: SlotId): Promise<DebateResult> {
     this.reset();
     this.query = query;
     this.phase = 'opening';
@@ -218,7 +255,7 @@ export class Conductor {
         break;
       }
 
-      const next = otherAgent(speaker);
+      const next = this.other(speaker);
       this.bus.emit({
         kind: 'relay',
         from: speaker,
@@ -256,22 +293,24 @@ export class Conductor {
    * own gloss on that answer would be doet talking over the message it is
    * relaying, and worse, letting an agent brief its own reviewer.
    */
-  private async recapExchange(agent: AgentId): Promise<void> {
-    const info = this.agents[agent].info();
+  private async recapExchange(agent: SlotId): Promise<void> {
+    const info = this.adapter(agent).info();
     if (!info.sessionId) return;
     const text = await recap({
       bus: this.bus,
-      agent,
+      slot: agent,
+      cli: info.cli,
       sessionId: info.sessionId,
       cwd: info.cwd,
       scope: 'exchange',
-      // Only Codex reads this — see `recap.ts` for why it cannot be asked the
-      // way Claude is. Passed for both so the caller has one shape.
+      // Only the agents that cannot be forked read this — see `recap.ts` for
+      // why they cannot be asked the way Claude is. Passed for all so the
+      // caller has one shape.
       said: this.exchanges[this.exchanges.length - 1]?.text ?? '',
     });
     if (!text) return;
     this.bus.emit({ kind: 'recap', agent, text, round: this.round });
-    this.store.appendNote(`${AGENT_LABELS[agent]} — ${text}`);
+    this.store.appendNote(`${this.labelFor(agent)} — ${text}`);
   }
 
   /**
@@ -281,18 +320,19 @@ export class Conductor {
    * the one that has seen every exchange: it wrote the final answer, and it
    * read everything that led there.
    */
-  private async recapSession(agent: AgentId): Promise<void> {
+  private async recapSession(agent: SlotId): Promise<void> {
     if (this.exchanges.length === 0) return;
-    const info = this.agents[agent].info();
+    const info = this.adapter(agent).info();
     if (!info.sessionId) return;
     const text = await recap({
       bus: this.bus,
-      agent,
+      slot: agent,
+      cli: info.cli,
       sessionId: info.sessionId,
       cwd: info.cwd,
       scope: 'session',
       said: this.exchanges
-        .map((exchange) => `${AGENT_LABELS[exchange.agent]}:\n${exchange.text}`)
+        .map((exchange) => `${this.labelFor(exchange.agent)}:\n${exchange.text}`)
         .join('\n\n'),
     });
     if (!text) return;
@@ -300,10 +340,10 @@ export class Conductor {
     this.store.writeSummary(text);
   }
 
-  private record(agent: AgentId, text: string): void {
+  private record(agent: SlotId, text: string): void {
     this.exchanges.push({ round: this.round, agent, text });
-    this.store.appendTurn(agent, this.round, text, null);
-    this.store.writeAgentHistory(agent, this.agents[agent].history());
+    this.store.appendTurn(this.labelFor(agent), this.round, text, null);
+    this.store.writeSlotHistory(agent, this.labelFor(agent), this.adapter(agent).history());
   }
 
   /**
@@ -315,7 +355,7 @@ export class Conductor {
    * started with, and repeating it every relay would be doet talking over the
    * agent it is quoting.
    */
-  private buildPrompt(speaker: AgentId): string {
+  private buildPrompt(speaker: SlotId): string {
     const notes = this.interjections.splice(0);
     const prefix = notes.length > 0
       ? `${notes.map((note) => `The human broke in to say this. It takes priority.\n\n<human>\n${note}\n</human>`).join('\n\n')}\n\n`
@@ -327,6 +367,7 @@ export class Conductor {
     }
 
     const last = this.exchanges[this.exchanges.length - 1]!;
+    const from = this.labelFor(last.agent);
     // The first time an agent sees this conversation it is handed the other
     // one's answer — and, without this, nothing else. It has never been told
     // what was asked, so it is reviewing a reply to a question it cannot see;
@@ -337,17 +378,20 @@ export class Conductor {
       : `<request>\n${this.query}\n</request>\n\n`;
     this.greeted.add(speaker);
 
-    return `${prefix}${request}Answer by ${AGENT_LABELS[last.agent]}:
+    // The tag is the slot rather than the CLI id, because with the same CLI on
+    // both sides `<claude>…</claude>` would be an agent reading its own name
+    // around somebody else's words.
+    return `${prefix}${request}Answer by ${from}:
 
-<${last.agent}>
+<slot-${last.agent}>
 ${last.text}
-</${last.agent}>`;
+</slot-${last.agent}>`;
   }
 
-  private async speak(agent: AgentId, prompt: string, label: string): Promise<TurnResult> {
+  private async speak(agent: SlotId, prompt: string, label: string): Promise<TurnResult> {
     this.active = agent;
     try {
-      return await this.agents[agent].send(prompt, label);
+      return await this.adapter(agent).send(prompt, label);
     } finally {
       this.active = null;
     }
@@ -355,7 +399,7 @@ ${last.text}
 
   private conclude(
     query: string,
-    lastSpeaker: AgentId,
+    lastSpeaker: SlotId,
     reason: DebateResult['reason'],
   ): DebateResult {
     const last = this.exchanges[this.exchanges.length - 1];
@@ -392,8 +436,8 @@ ${last.text}
  * Sent once at launch rather than on top of every relay, so a turn can be just
  * the thing that is new.
  */
-export function coCodeInstructions(self: AgentId, other: AgentId, rounds: number): string {
-  return `You are ${AGENT_LABELS[self]}, working alongside ${AGENT_LABELS[other]} in a session run
+export function coCodeInstructions(self: string, other: string, rounds: number): string {
+  return `You are ${self}, working alongside ${other} in a session run
 by \`doet\`. doet is a relay: it passes messages between the two of you and never writes any of
 the answer itself. You share one working tree, and you take turns — never edit while it is not
 your turn.
@@ -403,10 +447,10 @@ and improves it; it comes back, and so on. The human chose ${rounds} exchange${r
 and can stop it sooner. Being corrected here is cheap. Shipping something wrong is not.
 
 Do the actual work — read the files, run the commands — rather than describing what you would
-do. Be specific enough that ${AGENT_LABELS[other]} can check your reasoning instead of guessing
+do. Be specific enough that ${other} can check your reasoning instead of guessing
 at it.
 
-When you are handed ${AGENT_LABELS[other]}'s answer, that message is theirs, passed through
+When you are handed ${other}'s answer, that message is theirs, passed through
 untouched; doet adds no instructions to it. Check what you can — read the files they cite, run
 the commands, see whether it holds up. Then write your own best version of the answer rather
 than notes on theirs. Concede plainly when you are wrong and hold your position when you are

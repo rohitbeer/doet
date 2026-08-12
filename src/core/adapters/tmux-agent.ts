@@ -1,22 +1,18 @@
 import type { Bus } from '../bus.js';
-import { AGENT_LABELS } from '../relay.js';
-import {
-  awaitTranscript,
-  awaitTurn,
-  existingTranscripts,
-  readJournal,
-  sessionIdFor,
-  type JournalState,
-} from '../journal.js';
+import { cliFor } from '../agents/registry.js';
+import type { Autonomy, CliDefinition } from '../agents/types.js';
+import { framedPrompt } from '../relay.js';
+import { awaitSession, awaitTurn, type JournalState } from '../journal.js';
 import type { TmuxSession } from '../tmux.js';
 import {
   type AgentAdapter,
-  type AgentId,
   type AgentInfo,
   type AgentStatus,
+  type CliId,
   type Effort,
   type InFlightDelivery,
   type ModelChoice,
+  type SlotId,
   type TurnResult,
   type Usage,
 } from '../types.js';
@@ -43,13 +39,24 @@ import { renderHistory, type HistoryEntry } from '../util.js';
 
 export interface TmuxAgentOptions {
   bus: Bus;
-  cli: AgentId;
+  /**
+   * Which agent in the run this is, and the identity everything else uses.
+   *
+   * Separate from `cli` since DOET-004, because they stopped being the same
+   * thing: a VS run can put kilo in three slots at once, and co-code can be
+   * Claude against Claude. The CLI says what program is in the pane; the slot
+   * says which pane.
+   */
+  slot: SlotId;
+  cli: CliId;
   session: TmuxSession;
   /** Pane title, e.g. `A · Claude Code`. */
   title: string;
   cwd: string;
   model: string;
   effort?: Effort;
+  /** Which credentials to bill, for the CLIs that route to many vendors. */
+  provider?: string;
   /**
    * Directories the agent may touch beyond `cwd`. VS uses this for the shared
    * git metadata a linked worktree needs in order to commit at all.
@@ -79,18 +86,16 @@ export interface TmuxAgentOptions {
    * being off-screen costs it nothing.
    */
   placement?: 'split' | 'window';
-  /** Claude's posture: `default`, `acceptEdits`, `plan`, `bypassPermissions`. */
-  permissionMode?: string;
-  /** Codex's approval policy: `untrusted`, `on-request`, `never`. */
-  approvalPolicy?: string;
   /**
-   * Codex's sandbox: `read-only`, `workspace-write`, `danger-full-access`.
+   * How much this agent may do without stopping to ask.
    *
-   * `workspace-write` is not optional when `addDirs` is set — Codex refuses
-   * extra writable roots under any weaker sandbox and exits at startup saying
-   * so, which in VS means a slot that dies before it draws anything.
+   * One posture rather than each CLI's own vocabulary. It used to be three
+   * separate options here — Claude's permission mode, Codex's approval policy,
+   * Codex's sandbox — which meant every caller had to know which of them
+   * applied to the agent it was starting, and a fourth CLI would have added a
+   * fourth. The translation is the definition's job now; see `Autonomy`.
    */
-  sandbox?: string;
+  autonomy?: Autonomy;
 }
 
 /** How long to wait for a CLI's own UI to come up before sending it anything. */
@@ -129,11 +134,14 @@ const STALL_QUIET_MS = 20_000;
 const ATTENTION_QUIET_MS = 6_000;
 
 export class TmuxAgent implements AgentAdapter {
-  readonly id: AgentId;
+  readonly slot: SlotId;
+  readonly cli: CliId;
   readonly label: string;
 
   private readonly bus: Bus;
   private readonly opts: TmuxAgentOptions;
+  /** Everything that differs between the four CLIs. See `core/agents/`. */
+  private readonly def: CliDefinition;
 
   private pane: string | null = null;
   /** The window this agent has to itself, under the modern layout only. */
@@ -151,7 +159,7 @@ export class TmuxAgent implements AgentAdapter {
   private usage: Usage = {};
   private models: ModelChoice[];
 
-  /** Turns already read out of the transcript — the cursor `awaitTurn` reads from. */
+  /** Turns already read out of the session — the cursor `awaitTurn` reads from. */
   private turnsSeen = 0;
   private transcriptOf: HistoryEntry[] = [];
   private sessionSeq = 0;
@@ -159,18 +167,29 @@ export class TmuxAgent implements AgentAdapter {
   private busy = false;
   /** Last screen seen while waiting, for telling a stalled turn from a slow one. */
   private lastScreen = '';
-  /** Transcripts that existed before this pane started, so a new one stands out. */
-  private knownTranscripts = new Set<string>();
+  /** Sessions that existed before this pane started, so a new one stands out. */
+  private knownSessions = new Set<string>();
   private interruptedTurn = false;
+  /**
+   * Whether doet's standing brief still has to be said.
+   *
+   * Only ever true for a CLI that cannot take it as a launch flag, and only
+   * until the first prompt carries it. See `supports.systemPrompt`.
+   */
+  private briefPending = false;
 
   constructor(opts: TmuxAgentOptions) {
-    this.id = opts.cli;
-    this.label = AGENT_LABELS[opts.cli];
+    this.slot = opts.slot;
+    this.cli = opts.cli;
+    this.def = cliFor(opts.cli);
+    this.label = this.def.label;
     this.bus = opts.bus;
     this.opts = opts;
     this.model = opts.model;
     this.effort = opts.effort;
     this.models = opts.models ?? [];
+    this.briefPending =
+      this.def.supports.systemPrompt === 'prompt' && Boolean(opts.instructions?.trim());
   }
 
   // -------------------------------------------------------------------------
@@ -187,42 +206,39 @@ export class TmuxAgent implements AgentAdapter {
    * anyway, so nothing is lost by fixing it here.
    */
   private argv(resume?: string): { command: string; args: string[] } {
-    const addDirs = this.opts.addDirs ?? [];
-
-    if (this.id === 'claude') {
-      const args: string[] = [];
-      if (resume) args.push('--resume', resume);
-      if (this.model) args.push('--model', this.model);
-      if (this.effort) args.push('--effort', this.effort);
-      if (this.opts.permissionMode) args.push('--permission-mode', this.opts.permissionMode);
-      for (const dir of addDirs) args.push('--add-dir', dir);
-      if (this.opts.instructions) args.push('--append-system-prompt', this.opts.instructions);
-      return { command: 'claude', args };
-    }
-
-    const args: string[] = [];
-    if (resume) args.push('resume', resume);
-    if (this.model) args.push('--model', this.model);
-    // Codex takes reasoning effort as a config override rather than a flag.
-    if (this.effort) args.push('-c', `model_reasoning_effort="${this.effort}"`);
-    if (this.opts.approvalPolicy) args.push('--ask-for-approval', this.opts.approvalPolicy);
-    // Forced up to `workspace-write` when there are extra roots, because Codex
-    // rejects them outright otherwise and takes the whole pane down with it.
-    const sandbox = this.opts.sandbox ?? (addDirs.length > 0 ? 'workspace-write' : undefined);
-    if (sandbox) args.push('--sandbox', addDirs.length > 0 ? 'workspace-write' : sandbox);
-    for (const dir of addDirs) args.push('--add-dir', dir);
-    return { command: 'codex', args };
+    const supports = this.def.supports;
+    return {
+      command: this.def.command,
+      args: this.def.launch({
+        cwd: this.opts.cwd,
+        model: this.model,
+        // Asked for only where there is a dial to set. Passing `high` to a CLI
+        // that has none would either be ignored or rejected, and both are worse
+        // than doet knowing it has nothing to say here.
+        ...(this.effort && supports.efforts?.includes(this.effort) ? { effort: this.effort } : {}),
+        ...(supports.provider && this.opts.provider ? { provider: this.opts.provider } : {}),
+        // Extra writable roots are dropped rather than faked for the CLIs with
+        // no flag for them. What that costs is recorded where it bites, in the
+        // VS worktree setup — see `driveVs`.
+        addDirs: supports.addDirs ? (this.opts.addDirs ?? []) : [],
+        ...(supports.systemPrompt === 'append' && this.opts.instructions
+          ? { instructions: this.opts.instructions }
+          : {}),
+        autonomy: this.opts.autonomy ?? 'ask',
+        ...(resume ? { resume } : {}),
+      }),
+    };
   }
 
   async start(): Promise<void> {
     this.setStatus('starting');
     this.startedAt = Date.now();
     // The before-picture, taken while it is still true. `startedAt` alone is
-    // not enough to identify this session's transcript: the file is not written
-    // until the first turn, which in co-code is several minutes and one whole
-    // exchange later, and anything else that writes a transcript in between
-    // would otherwise look newer and win.
-    this.knownTranscripts = existingTranscripts(this.id, this.opts.cwd);
+    // not enough to identify this session: it is not recorded until the first
+    // turn, which in co-code is several minutes and one whole exchange later,
+    // and anything else that opens a session in between would otherwise look
+    // newer and win.
+    this.knownSessions = await this.def.journal.known(this.opts.cwd);
 
     const { command, args } = this.argv();
     const spec = {
@@ -316,7 +332,7 @@ export class TmuxAgent implements AgentAdapter {
         }
         trusted += 1;
         this.bus.log(
-          this.id,
+          this.slot,
           `Confirmed the workspace trust prompt for ${this.opts.cwd} (doet created this worktree).`,
         );
         // `1` — the affirmative — chosen by number rather than by pressing
@@ -344,7 +360,7 @@ export class TmuxAgent implements AgentAdapter {
         throw new Error(
           `${this.label} is asking you to accept a mode that disables its safety checks. ` +
             'doet will not answer that for you — start the run without ' +
-            `${this.id === 'claude' ? '`bypassPermissions`' : '`--dangerously-bypass-approvals-and-sandbox`'}` +
+            `${this.cli === 'claude' ? '`bypassPermissions`' : '`--dangerously-bypass-approvals-and-sandbox`'}` +
             ', or answer it yourself in its pane.',
         );
       }
@@ -359,7 +375,7 @@ export class TmuxAgent implements AgentAdapter {
     }
     // Not fatal: a CLI that animates forever would never look stable, and the
     // paste is harmless if it is genuinely not ready.
-    this.bus.log(this.id, `${this.label} did not settle; continuing anyway.`, 'warn');
+    this.bus.log(this.slot, `${this.label} did not settle; continuing anyway.`, 'warn');
   }
 
   // -------------------------------------------------------------------------
@@ -374,40 +390,49 @@ export class TmuxAgent implements AgentAdapter {
     this.busy = true;
     this.interruptedTurn = false;
     this.sessionTurns += 1;
+    // What is pasted, which is not always what the caller asked for: a CLI that
+    // cannot take doet's brief as a launch flag gets it in front of its first
+    // request instead, once.
+    const sent = this.briefPending
+      ? framedPrompt(this.opts.instructions ?? '', prompt)
+      : prompt;
+    this.briefPending = false;
     this.transcriptOf.push({ role: 'user', text: prompt });
     this.setStatus('thinking');
-    this.bus.emit({ kind: 'prompt', agent: this.id, text: prompt, label });
+    this.bus.emit({ kind: 'prompt', agent: this.slot, text: prompt, label });
 
     try {
-      await this.opts.session.paste(pane, prompt, { submit: true });
+      await this.opts.session.paste(pane, sent, { submit: true });
 
-      // The transcript does not exist until the first prompt opens it — that is
+      // The session does not exist until the first prompt opens it — that is
       // also the first moment a session id exists — so it is located here
       // rather than at startup.
       if (!this.transcript) {
-        this.transcript = await awaitTranscript(this.id, this.opts.cwd, this.startedAt, {
+        this.transcript = await awaitSession(this.def.journal, this.opts.cwd, this.startedAt, {
           timeoutMs: TRANSCRIPT_TIMEOUT_MS,
-          known: this.knownTranscripts,
+          known: this.knownSessions,
+          cancelled: () => this.interruptedTurn,
         });
         if (this.transcript) {
-          this.sessionId = sessionIdFor(this.id, this.transcript) ?? undefined;
-          this.bus.emit({
-            kind: 'session',
-            agent: this.id,
-            sessionId: this.sessionId,
-
-          });
+          this.sessionId = (await this.def.journal.sessionId(this.transcript)) ?? undefined;
+          this.bus.emit({ kind: 'session', agent: this.slot, sessionId: this.sessionId });
         }
       }
       if (!this.transcript) {
         throw new Error(
-          `could not find ${this.label}'s transcript, so doet cannot tell when its turn ends.`,
+          `could not find ${this.label}'s session, so doet cannot tell when its turn ends.`,
         );
       }
 
       this.setStatus('working');
       let abandoned = false;
-      const state = await awaitTurn(this.id, this.transcript, {
+      /**
+       * Set when a turn is taken as finished because everything stopped, rather
+       * than because the journal said so. Only reachable for a CLI whose
+       * journal records no boundary — see `supports.turnEnd`.
+       */
+      let endedQuietly = false;
+      const state = await awaitTurn(this.def.journal, this.transcript, {
         after: this.turnsSeen,
         cancelled: () => this.interruptedTurn,
         stalled: async (quietMs) => {
@@ -444,6 +469,21 @@ export class TmuxAgent implements AgentAdapter {
           );
 
           if (quietMs < STALL_QUIET_MS) return false;
+
+          // For an agent whose journal records no turn boundary, a session and
+          // a screen that have both been still this long *is* the end of the
+          // turn — it is the only signal there is, and the alternative is a
+          // slot that waits for ever on a completion nothing will ever write.
+          //
+          // Guarded on the screen not looking like a question, because the one
+          // other thing that stops both at once is a permission prompt, and
+          // calling that "finished" would hand the run an answer the agent has
+          // not given yet.
+          if (this.def.supports.turnEnd === 'journal-or-quiet' && !asking(screen)) {
+            endedQuietly = true;
+            return true;
+          }
+
           abandoned = true;
           return true;
         },
@@ -453,18 +493,21 @@ export class TmuxAgent implements AgentAdapter {
         // What was written before it stopped is still the agent's work, and
         // still worth handing back — the caller decides what to do with a turn
         // that ended early, but it should not be handed an empty one.
-        const partial = readJournal(this.id, this.transcript);
+        const partial = await this.def.journal.read(this.transcript);
         const text = partial.turns.length > this.turnsSeen
           ? (partial.turns[partial.turns.length - 1]?.text ?? '')
           : '';
         this.absorb(partial);
         this.turnsSeen = Math.max(this.turnsSeen, partial.turns.length);
+        // A turn that ended quietly ended *normally*: no error, and not
+        // interrupted. It is only the boundary doet is unsure of, not whether
+        // the agent finished.
         return this.finish({
           text,
-          error: this.interruptedTurn || abandoned
+          error: this.interruptedTurn || abandoned || endedQuietly
             ? undefined
             : 'the turn did not finish in time.',
-          interrupted: this.interruptedTurn || abandoned,
+          interrupted: !endedQuietly && (this.interruptedTurn || abandoned),
         });
       }
 
@@ -487,11 +530,11 @@ export class TmuxAgent implements AgentAdapter {
     // on doet's account any more.
     this.setAttention(null);
     this.transcriptOf.push({ role: 'assistant', text: opts.text });
-    this.bus.emit({ kind: 'message', agent: this.id, text: opts.text });
-    this.bus.emit({ kind: 'turn-end', agent: this.id, text: opts.text });
+    this.bus.emit({ kind: 'message', agent: this.slot, text: opts.text });
+    this.bus.emit({ kind: 'turn-end', agent: this.slot, text: opts.text });
     this.setStatus(opts.error ? 'error' : 'ready');
     return {
-      agent: this.id,
+      agent: this.slot,
       text: opts.text,
       verdict: null,
       usage: this.usage,
@@ -503,7 +546,7 @@ export class TmuxAgent implements AgentAdapter {
   private absorb(state: JournalState): void {
     this.usage = state.usage;
     if (state.sessionId) this.sessionId = state.sessionId;
-    this.bus.emit({ kind: 'usage', agent: this.id, usage: this.usage });
+    this.bus.emit({ kind: 'usage', agent: this.slot, usage: this.usage });
   }
 
   /**
@@ -522,7 +565,7 @@ export class TmuxAgent implements AgentAdapter {
 
     await this.opts.session.paste(this.pane, body, { submit: true });
     this.transcriptOf.push({ role: 'user', text: body });
-    this.bus.emit({ kind: 'prompt', agent: this.id, text: body, label: 'added to this exchange' });
+    this.bus.emit({ kind: 'prompt', agent: this.slot, text: body, label: 'added to this exchange' });
     return 'live';
   }
 
@@ -603,7 +646,7 @@ export class TmuxAgent implements AgentAdapter {
     this.transcript = null;
     this.turnsSeen = 0;
     this.startedAt = Date.now();
-    this.knownTranscripts = existingTranscripts(this.id, cwd);
+    this.knownSessions = await this.def.journal.known(cwd);
 
     const { command, args } = this.argv(resume);
     this.setStatus('starting');
@@ -649,12 +692,18 @@ export class TmuxAgent implements AgentAdapter {
     /* nothing to re-attach to: doet never let go */
   }
 
-  /** Branching still means something: a second CLI on a copy of this session. */
+  /**
+   * A second CLI on a copy of this session, in whatever tree it is working in.
+   *
+   * Null for the two that cannot do it, rather than a resume dressed up as a
+   * fork: opening the *same* session a second time while the pane is still
+   * working in it is how you get two writers on one conversation, and both
+   * Codex and cline would either refuse it or quietly corrupt it. The dashboard
+   * asks first and says so when the answer is no.
+   */
   async forkSession(): Promise<{ command: string; args: string[] } | null> {
-    if (!this.sessionId) return null;
-    return this.id === 'claude'
-      ? { command: 'claude', args: ['--resume', this.sessionId, '--fork-session'] }
-      : { command: 'codex', args: ['resume', this.sessionId] };
+    if (!this.sessionId || !this.def.supports.fork) return null;
+    return this.def.fork(this.sessionId, this.opts.cwd);
   }
 
   history(): string {
@@ -663,7 +712,8 @@ export class TmuxAgent implements AgentAdapter {
 
   info(): AgentInfo {
     return {
-      id: this.id,
+      slot: this.slot,
+      cli: this.cli,
       label: this.label,
       model: this.model,
       effort: this.effort,
@@ -684,10 +734,10 @@ export class TmuxAgent implements AgentAdapter {
     return this.pane;
   }
 
-  /** Re-reads the transcript without waiting, for a live counter. */
-  refresh(): void {
+  /** Re-reads the session without waiting, for a live counter. */
+  async refresh(): Promise<void> {
     if (!this.transcript) return;
-    this.absorb(readJournal(this.id, this.transcript));
+    this.absorb(await this.def.journal.read(this.transcript));
   }
 
   async dispose(): Promise<void> {
@@ -702,13 +752,13 @@ export class TmuxAgent implements AgentAdapter {
   private setStatus(status: AgentStatus): void {
     if (this.status === status) return;
     this.status = status;
-    this.bus.emit({ kind: 'status', agent: this.id, status });
+    this.bus.emit({ kind: 'status', agent: this.slot, status });
   }
 
   private setAttention(note: string | null): void {
     if (this.attention === note) return;
     this.attention = note;
-    this.bus.emit({ kind: 'attention', agent: this.id, note });
+    this.bus.emit({ kind: 'attention', agent: this.slot, note });
   }
 }
 

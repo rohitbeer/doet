@@ -11,8 +11,6 @@ import type { Bus } from './bus.js';
 import { DOET_HOME } from './paths.js';
 import { AGENT_LABELS } from './relay.js';
 import {
-  AGENT_IDS,
-  type AgentId,
   type CliId,
   type DoetEvent,
   type Effort,
@@ -35,6 +33,17 @@ const DELIVERY_NOTE: Record<MessageDelivery, string> = {
  * and on what models. Written beside the markdown as the session runs, so a
  * crash or a quit does not strand the conversation.
  */
+export interface SessionParticipant {
+  cli: CliId;
+  sessionId?: string;
+  model: string;
+  effort?: Effort;
+  provider?: string;
+  /** VS only: co-code's participants share the tree doet was started in. */
+  branch?: string;
+  worktree?: string;
+}
+
 export interface SessionMeta {
   id: string;
   startedAt: string;
@@ -43,16 +52,19 @@ export interface SessionMeta {
   query: string;
   /** Missing on sessions written before modes existed; read as co-code. */
   mode?: 'co-code' | 'vs';
-  agents: Record<AgentId, { sessionId?: string; model: string; effort?: Effort }>;
   base?: string;
-  slots?: Record<SlotId, {
-    cli: CliId;
-    sessionId?: string;
-    model: string;
-    effort?: Effort;
-    branch: string;
-    worktree: string;
-  }>;
+  /**
+   * The participants, keyed by slot and ordered by `order`.
+   *
+   * This used to be two records — an `agents` keyed by CLI id for co-code and a
+   * `slots` keyed by slot for VS — and the first of those stopped working the
+   * moment co-code could run the same CLI on both sides, since two Claudes
+   * collapse into one key. Both modes write this now. A session written by an
+   * older doet has neither field in this shape and simply reads back with no
+   * participants, which the reader treats as "unknown" rather than "none".
+   */
+  order?: SlotId[];
+  slots?: Record<SlotId, SessionParticipant>;
 }
 
 /**
@@ -93,7 +105,7 @@ export class SessionStore {
   // Resuming
   // -------------------------------------------------------------------------
 
-  writeMeta(meta: Omit<SessionMeta, 'id' | 'startedAt' | 'updatedAt'>): void {
+  writeMeta(meta: Omit<SessionMeta, 'id' | 'startedAt' | 'updatedAt' | 'mode'>): void {
     this.safely(() =>
       writeFileSync(
         this.path('meta.json'),
@@ -117,6 +129,7 @@ export class SessionStore {
     cwd: string;
     query: string;
     base: string;
+    order: SlotId[];
     slots: NonNullable<SessionMeta['slots']>;
   }): void {
     this.safely(() =>
@@ -128,10 +141,6 @@ export class SessionStore {
             startedAt: this.startedAt.toISOString(),
             updatedAt: new Date().toISOString(),
             mode: 'vs',
-            agents: {
-              claude: { model: '' },
-              codex: { model: '' },
-            },
             ...meta,
           } satisfies SessionMeta,
           null,
@@ -297,12 +306,18 @@ export class SessionStore {
     );
   }
 
-  /** Called as each turn completes, so the file is never behind the screen. */
-  appendTurn(agent: AgentId, round: number, text: string, verdict: string | null): void {
+  /**
+   * Called as each turn completes, so the file is never behind the screen.
+   *
+   * Takes a label rather than looking one up from the agent id: co-code can now
+   * run the same CLI on both sides, so "Claude Code" twice in a transcript
+   * would be unreadable. The caller knows which slot it is and says so.
+   */
+  appendTurn(label: string, round: number, text: string, verdict: string | null): void {
     this.safely(() =>
       appendFileSync(
         this.path('session.md'),
-        `\n### ${round}. ${AGENT_LABELS[agent]}${verdict ? ` — ${verdict}` : ''}\n\n${text}\n`,
+        `\n### ${round}. ${label}${verdict ? ` — ${verdict}` : ''}\n\n${text}\n`,
         'utf8',
       ),
     );
@@ -318,18 +333,6 @@ export class SessionStore {
 
   readSummary(): string {
     return this.read('summary.md');
-  }
-
-  /** Snapshots one agent's own session transcript. */
-  writeAgentHistory(agent: AgentId, markdown: string): void {
-    if (!markdown.trim()) return;
-    this.safely(() =>
-      writeFileSync(
-        this.path(`${agent}.md`),
-        `# ${AGENT_LABELS[agent]} — session transcript\n\n${markdown}\n`,
-        'utf8',
-      ),
-    );
   }
 
   writeSlotHistory(slot: SlotId, label: string, markdown: string): void {
@@ -364,15 +367,16 @@ export class SessionStore {
   finalizeVs(result: VsResult, scoreboard = ''): string {
     const path = this.path('result.md');
     this.safely(() => {
-      const sections = (['a', 'b'] as const).map((slot) => {
+      const sections = result.order.flatMap((slot) => {
         const side = result.slots[slot];
+        if (!side) return [];
         const summary = side.changed
           ? `${side.files} files · +${side.insertions} −${side.deletions}`
           : 'no committed changes';
-        return `## Slot ${slot.toUpperCase()} — ${AGENT_LABELS[side.cli]}\n\n` +
+        return [`## Slot ${slot.toUpperCase()} — ${AGENT_LABELS[side.cli]}\n\n` +
           `- Branch: \`${side.branch}\`\n- Worktree: \`${side.worktree}\`\n` +
           `- Result: ${summary}${side.error ? `\n- Error: ${side.error}` : ''}\n\n` +
-          `${side.diffstat ? `\`\`\`text\n${side.diffstat}\n\`\`\`\n` : ''}`;
+          `${side.diffstat ? `\`\`\`text\n${side.diffstat}\n\`\`\`\n` : ''}`];
       });
       writeFileSync(
         path,
@@ -385,8 +389,10 @@ export class SessionStore {
   }
 
   /** Snapshot everything the agents know, e.g. on quit. */
-  snapshot(histories: Record<AgentId, string>): void {
-    for (const id of AGENT_IDS) this.writeAgentHistory(id, histories[id]);
+  snapshot(histories: Array<{ slot: SlotId; label: string; markdown: string }>): void {
+    for (const { slot, label, markdown } of histories) {
+      this.writeSlotHistory(slot, label, markdown);
+    }
   }
 
   private safely(write: () => void): void {

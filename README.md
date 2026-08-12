@@ -1,25 +1,62 @@
 # doet
 
-Two coding agents, two ways to work.
+Several coding agents, two ways to work.
+
+doet drives four CLIs, and adding the next one is a file rather than a change
+everywhere:
+
+| | | effort dial | bring your own key | forkable session |
+|---|---|:-:|:-:|:-:|
+| `claude` | Claude Code | ● | | ● |
+| `codex` | Codex | ● | | |
+| `cline` | Cline | ● | ● | |
+| `kilo` | Kilo | | ● | ● |
+
+Any of them can take any slot, including the same one in several slots at once.
+What differs between them is not hidden: a CLI with no reasoning dial is never
+asked for an effort, and one whose session cannot be copied says so rather than
+offering you a fork it would have to fake.
 
 doet has two modes:
 
 - **co-code** is the original passer: one agent answers, doet hands the full
   response to the other, and they review each other for the number of exchanges
-  you choose.
-- **vs** sends the exact same task to two independent sessions in isolated git
-  worktrees. Each slot can use Claude or Codex, including the same CLI/model on
-  both sides, with its own model and effort setting. It reports what each side
-  spent getting there — time, tokens, cost — and lets you message either slot on
-  its own, mid-run or between runs, without the other one hearing it.
+  you choose. Any two CLIs, including two of the same — Claude against Claude is
+  a real comparison, and the slot letter keeps them apart.
+- **vs** sends the exact same task to **up to nine** independent sessions, each
+  in its own git worktree cut from the branch you are on. Every agent starts
+  from exactly what you had and none of them can see another's work. doet reports
+  what each one spent getting there — time, tokens, cost — and lets you message
+  any of them on its own, mid-run or between runs, without the others hearing it.
 
-Both agents run in panes inside doet, and **every permission prompt from either
-agent surfaces in doet** with the same three keys. You approve a Codex shell
-command and a Claude file edit the same way, without learning two UIs.
+Past two agents there is no room to show them side by side, so a vs run gives
+doet the whole terminal and files each agent in a window of its own:
 
-Each pane shows both halves of that agent's conversation — the prompt doet
-handed it (`▎` gutter) and everything it said back. Text wraps, and the panes
-scroll, so nothing is lost off the right edge.
+```
+ doet · vs · 5 agents · ⠹ all 5 working · Type a request — all 5 agents get it
+ ── ⠹ running · 2m 14s wall clock ──
+ ❯ A Claude Code    1m 58s ·  24.1k in ·  3.2k out · $0.41 · 4f +180 −22
+   B Codex          2m 14s ·  31.0k in ·  2.8k out · –     · 3f +96 −14
+   C Kilo           1m 02s ·  18.4k in ·  1.9k out · $0.07 · 2f +64 −8
+   D Cline          2m 09s ·   9.2k in ·  1.1k out · –     · 5f +210 −41
+   E Claude Code    1m 44s ·  22.7k in ·  2.4k out · $0.36 · 4f +171 −19
+```
+
+`↑` `↓` walks the list. `enter` opens that agent's window and you watch it work
+at the full width of your terminal. `w` opens its **worktree** with its session
+forked into it — a copy of everything that agent has read and done, in the
+checkout it did it in, while the run carries on undisturbed.
+
+Every agent runs as its real terminal program in a real tmux pane, rendering
+itself, exactly as if you had started it yourself. Its permission prompts are
+its own and you answer them in its own pane — doet does not stand in the way,
+and does not try to redraw a UI each CLI already has.
+
+What doet knows about a run it reads from the record each CLI keeps, not from
+the screen. Claude and Codex write a transcript per session; cline and kilo keep
+theirs in SQLite. Either way the question is the same — has a turn finished,
+what did it say, what did it cost — and where the answer comes from is the
+adapter's business. See `src/core/agents/`.
 
 Markdown is rendered, not printed: both agents write it and both their CLIs
 display it, so showing raw `**asterisks**` in doet would be a step down from
@@ -51,8 +88,20 @@ breaking early.
 
 ## Install
 
-Needs Node 20+, plus the `claude` and `codex` CLIs on `PATH` and already
-logged in.
+Needs Node 20+, plus whichever agent CLIs you intend to use on `PATH` and
+already logged in. doet checks before it builds anything and names the ones it
+cannot find, rather than letting a pane die during startup in a window you have
+not attached to yet.
+
+```bash
+npm i -g cline @kilocode/cli     # the two that are not already yours
+```
+
+Node 22.5+ is worth having even though 20 works. cline and kilo keep their
+sessions in SQLite, and on 22.5+ doet reads those databases directly through
+`node:sqlite` — about 8ms a read. Below that it falls back to asking the CLI
+itself, which is the supported route and around 1.5 seconds a read, so a run is
+a beat less responsive and nothing else changes.
 
 Install from a clone kept somewhere other than where you work on doet, so the
 doet you use does not change under you while you are changing it:
@@ -83,11 +132,13 @@ copy uses, so the two cannot disturb each other.
 ```bash
 doet                                  # pick co-code or vs at launch
 doet --mode co-code                   # the original relayed conversation
-doet --mode vs                        # two isolated implementations
+doet --mode vs                        # isolated implementations, one per agent
+doet --mode vs --agents 5             # five of them, each in its own worktree
 doet --ui modern                      # agents filed under their names, not on screen
-doet --rounds 8 --first codex
-doet -C ~/projects/api --claude-model opus --claude-effort high
-doet --summary codex --summary-model gpt-5.4-mini
+doet --rounds 8
+doet -C ~/projects/api --model claude=opus --effort claude=high
+doet --model kilo=anthropic/claude-opus-4 --provider kilo=anthropic
+doet --model cline=claude-opus-4 --provider cline=anthropic --effort cline=xhigh
 
 doet --sessions                       # what you have to come back to
 doet --resume                         # reopen the latest session here
@@ -97,22 +148,40 @@ doet --resume 2026-08-07T09-09-48     # or a specific one, by id or prefix
 In co-code, type a question, press enter, then pick who answers first. While an
 exchange runs, anything you type becomes a note delivered before the next turn.
 
-In vs, choose the CLI, model and effort independently for slots A and B, then
-enter one task. Both sessions run concurrently on branches cut from the same
-clean HEAD. Select a result with `←` / `→`; `enter` opens that exact live agent
-session and returns to doet when you exit. Press `a` to open a terminal in its
-worktree, squash and commit its branch into the main tree, continue the same
-live session from doet's composer, or explicitly discard that branch/worktree.
-Plug-in commits keep the main tree clean, so the other result can be stacked
-afterwards. Follow-up turns are committed and appended to the session Markdown.
+In vs, say how many agents you want, then choose each one in turn: which CLI,
+whose credentials, which model, how hard it should think. Each question is
+skipped when that CLI has no answer to give — Claude and Codex have one provider
+and publish no model list, so choosing either asks nothing more and takes the
+model from your config. kilo lists 288 models across a dozen providers, which is
+exactly why it asks whose account is paying before it asks which model.
 
-A band under the panes counts what each slot is spending as it spends it —
-time, tokens in and out, and cost — and settles into the final comparison when
-both finish. See [What a run costs](#what-a-run-costs).
+Then enter one task. Every session runs concurrently on a branch cut from the
+tip of the branch you were on. Walk the list with `↑` / `↓`; `enter` opens that
+agent's window, `w` opens its worktree with the session forked, `tab` addresses
+it alone, and `p` squashes its branch into the main tree and keeps that agent
+working there. Plug-in commits keep the main tree clean, so a second result can
+be stacked afterwards. Follow-up turns are committed and appended to the session
+Markdown.
 
-Select a slot and press `m` to send that slot a message — into the exchange it
-is running, or as a turn of its own if it is idle, but always to that slot alone
+A band at the top counts what each agent is spending as it spends it — time,
+tokens in and out, and cost — and settles into the final comparison when the
+last one finishes. See [What a run costs](#what-a-run-costs).
+
+`tab` addresses one agent, so `enter` then sends to it alone — into the exchange
+it is running, or as a turn of its own if it is idle, but always to that agent
 and always straight away. See [Messaging one slot](#messaging-one-slot).
+
+| Key | in a vs run |
+|---|---|
+| `↑` / `↓` | move between agents |
+| `enter` | with an empty composer, open the selected agent's window |
+| `w` | open its worktree, with its session forked into it |
+| `tab` | address the selected agent alone |
+| `p` | squash its branch into the main tree |
+| `x` | abort a merge that stopped in conflict |
+| `esc` | clear the address, or stop the current turn |
+| `F1`–`F9` / `F12` | jump to an agent's window, or back to doet |
+| `ctrl+c` | quit; branches and worktrees are kept |
 
 | Key | |
 |---|---|
@@ -207,10 +276,10 @@ usual.
 
 ## Messaging one slot
 
-The composer at the bottom addresses both slots, because that is what makes a VS
-run a comparison. Sometimes you need the opposite: to say something to *one*
-agent, in its own session, about its own branch — a correction to slot A that
-would corrupt the comparison if slot B heard it too.
+The composer at the bottom addresses every agent at once, because that is what
+makes a VS run a comparison. Sometimes you need the opposite: to say something
+to *one* agent, in its own session, about its own branch — a correction to slot
+A that would corrupt the comparison if the others heard it too.
 
 Select the slot and press `m`. What you type goes to that slot and no other, and
 it goes **now**. Nothing is saved for later and nothing is attached to whatever
@@ -706,8 +775,22 @@ small queue rather than a bare `EventEmitter`.
 
 ## Limits
 
-- There are two slots. In co-code they are Claude and Codex; in vs either slot
-  can independently be Claude or Codex.
+- co-code runs exactly two agents; vs runs up to nine. Either mode can put any
+  of the four CLIs in any slot, including the same one in several at once.
+- The nine is the keyboard, not the machine: each agent gets a tmux window and a
+  single-digit key to reach it, and there is no unambiguous tenth.
+- kilo has no reasoning-effort dial — it chooses per model — so doet never asks
+  it for one.
+- cline's `-s` replaces its system prompt rather than adding to it, and kilo has
+  no such flag at all, so for those two doet's standing brief rides in front of
+  the first request instead of being a launch flag.
+- Codex and cline cannot copy a session, so `w` will not open a worktree for
+  them: resuming the session an agent is still working in means two writers on
+  one conversation. doet says so rather than doing it.
+- cline is the one agent whose turn boundary doet infers rather than reads. If
+  its message file parses, the journal is authoritative; if it does not, a still
+  session and a still screen end the turn, and tokens show as `–` rather than
+  being invented.
 - A pane is a view, not a terminal. `enter`/`ctrl+o` hands this terminal to the
   real CLI and re-attaches when it exits.
 - Taking a session over interrupts that slot's current turn, releases the

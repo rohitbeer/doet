@@ -1,14 +1,12 @@
-import type { AgentId, AgentStatus } from '../core/types.js';
+import type { AgentStatus } from '../core/types.js';
 
 /**
- * Each agent gets one colour and keeps it everywhere — pane border, relay
- * arrows, permission prompt, status bar. In a split view where both sides
- * stream at once, colour is the fastest way to tell who is talking.
+ * Each agent's colour now lives with the rest of that CLI's facts, in
+ * `core/agents/`, so that adding one is a single file rather than a file plus
+ * an entry in every record keyed by agent. Re-exported because the UI asks for
+ * it constantly and has no other reason to know the registry exists.
  */
-export const AGENT_COLOR: Record<AgentId, string> = {
-  claude: 'magenta',
-  codex: 'cyan',
-};
+export { AGENT_COLOR } from '../core/agents/registry.js';
 
 export const STATUS_LABEL: Record<AgentStatus, string> = {
   stopped: 'stopped',

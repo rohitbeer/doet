@@ -2,7 +2,6 @@ import type { PricingTable } from './pricing.js';
 import { renderScoreboard } from './scoreboard.js';
 import type { SessionStore } from './sessions.js';
 import {
-  SLOT_IDS,
   type AgentAdapter,
   type CliId,
   type MessageDelivery,
@@ -39,12 +38,22 @@ export interface AddedMessage {
 }
 
 /**
- * Runs two isolated implementations of one request. There is deliberately no
+ * Runs N isolated implementations of one request. There is deliberately no
  * relay, judging, or synthesis here: each session sees the exact same prompt
  * and owns a different git worktree.
+ *
+ * It was two until DOET-004, and the widening changed less than it looks. The
+ * slots were already independent — each with its own bus, its own worktree, its
+ * own inflight promise, released the moment it settled rather than when the
+ * pair did — so going from two to nine is mostly a matter of iterating `order`
+ * instead of naming `a` and `b`. What genuinely had to change is that nothing
+ * may assume a *pair* any more: no `Promise.all([a, b])`, no "the other one",
+ * and a wall clock that is the slowest of many rather than the slower of two.
  */
 export class VsRunner {
   private readonly sides: Record<SlotId, VsSide>;
+  /** The slots, in the order they were laid out. The only source of order. */
+  private readonly order: SlotId[];
   private readonly store: SessionStore;
   private readonly root: string;
   private readonly pricing: PricingTable;
@@ -55,21 +64,40 @@ export class VsRunner {
    * follow-up, a handover and a reconnect all pass through the runner and none
    * of them go through React. Tokens are not here — see `statsFor`.
    */
-  private readonly stats: Record<SlotId, Omit<VsSlotStats, 'usage'>> = {
-    a: { turns: 0, addOns: 0, activeMs: 0 },
-    b: { turns: 0, addOns: 0, activeMs: 0 },
-  };
+  private readonly stats: Record<SlotId, Omit<VsSlotStats, 'usage'>>;
 
   constructor(opts: {
     sides: Record<SlotId, VsSide>;
+    order: SlotId[];
     store: SessionStore;
     root: string;
     pricing?: PricingTable;
   }) {
     this.sides = opts.sides;
+    this.order = [...opts.order];
     this.store = opts.store;
     this.root = opts.root;
     this.pricing = opts.pricing ?? {};
+    this.stats = Object.fromEntries(
+      this.order.map((slot) => [slot, { turns: 0, addOns: 0, activeMs: 0 }]),
+    );
+  }
+
+  private statsOf(slot: SlotId): Omit<VsSlotStats, 'usage'> {
+    const stats = this.stats[slot];
+    if (!stats) throw new Error(`There is no slot ${slot.toUpperCase()} in this run.`);
+    return stats;
+  }
+
+  /** The slots this run holds, in order. */
+  get slots(): SlotId[] {
+    return [...this.order];
+  }
+
+  sideFor(slot: SlotId): VsSide {
+    const side = this.sides[slot];
+    if (!side) throw new Error(`There is no slot ${slot.toUpperCase()} in this run.`);
+    return side;
   }
 
   get isRunning(): boolean {
@@ -88,7 +116,8 @@ export class VsRunner {
    * and one that sits on `–` until the run is over.
    */
   statsFor(slot: SlotId): VsSlotStats {
-    return { ...this.stats[slot], usage: { ...this.sides[slot].adapter.info().usage } };
+    const stats = this.stats[slot] ?? { turns: 0, addOns: 0, activeMs: 0 };
+    return { ...stats, usage: { ...this.sideFor(slot).adapter.info().usage } };
   }
 
   async run(query: string): Promise<VsResult> {
@@ -97,16 +126,17 @@ export class VsRunner {
     this.store.openVsQuestion(query);
 
     const startedAt = Date.now();
-    // Each side releases its own slot the moment it settles, rather than both
-    // being released when the pair does. The two slots are independent, and a
-    // slot that finished a minute ago is genuinely idle: you can message it,
-    // continue it, or take its session over without waiting on the other one.
-    // Clearing them together made the faster slot report "still finishing its
-    // last turn" for as long as the slower one ran — which is exactly the
-    // window in which you want to talk to it.
+    // Each side releases its own slot the moment it settles, rather than all of
+    // them being released when the last one does. The slots are independent,
+    // and a slot that finished a minute ago is genuinely idle: you can message
+    // it, continue it, or take its session over without waiting on the rest.
+    // Clearing them together made every fast slot report "still finishing its
+    // last turn" for as long as the slowest one ran — which is exactly the
+    // window in which you want to talk to it, and with nine agents it is nearly
+    // the whole run.
     const pending = {} as Record<SlotId, Promise<VsSlotResult>>;
-    for (const slot of SLOT_IDS) {
-      const side: Promise<VsSlotResult> = this.runSide(this.sides[slot], query).finally(() => {
+    for (const slot of this.order) {
+      const side: Promise<VsSlotResult> = this.runSide(this.sideFor(slot), query).finally(() => {
         if (this.inflight[slot] === side) delete this.inflight[slot];
       });
       pending[slot] = side;
@@ -114,11 +144,15 @@ export class VsRunner {
     }
 
     try {
-      const [a, b] = await Promise.all([pending.a, pending.b]);
+      const settled = await Promise.all(this.order.map((slot) => pending[slot]!));
+      const slots = Object.fromEntries(
+        this.order.map((slot, index) => [slot, settled[index]!]),
+      ) as Record<SlotId, VsSlotResult>;
       const result: VsResult = {
         query,
-        base: this.sides.a.worktree.base,
-        slots: { a, b },
+        base: this.sideFor(this.order[0]!).worktree.base,
+        order: [...this.order],
+        slots,
         elapsedMs: Date.now() - startedAt,
       };
       this.store.finalizeVs(result, renderScoreboard(result, this.pricing));
@@ -127,15 +161,15 @@ export class VsRunner {
       // Belt and braces for a side that never reached its own cleanup. Guarded
       // by identity: a solo turn started on a slot that finished early belongs
       // to that turn, not to this run, and must not be cleared here.
-      for (const slot of SLOT_IDS) {
+      for (const slot of this.order) {
         if (this.inflight[slot] === pending[slot]) delete this.inflight[slot];
       }
     }
   }
 
   async abort(slot?: SlotId): Promise<void> {
-    const targets = slot ? [slot] : SLOT_IDS;
-    await Promise.all(targets.map((id) => this.sides[id].adapter.interrupt().catch(() => {})));
+    const targets = slot ? [slot] : this.order;
+    await Promise.all(targets.map((id) => this.sideFor(id).adapter.interrupt().catch(() => {})));
   }
 
   async whenSlotIdle(slot: SlotId): Promise<void> {
@@ -162,7 +196,7 @@ export class VsRunner {
    * shared prompt. Nothing is stored now — a message you send is sent.
    */
   async addMessage(slot: SlotId, text: string): Promise<AddedMessage> {
-    const side = this.sides[slot];
+    const side = this.sideFor(slot);
     const body = text.trim();
     if (!body) throw new Error('An added message needs some text.');
 
@@ -171,7 +205,7 @@ export class VsRunner {
     // between the check and the call would otherwise be added to thin air.
     const delivery = await side.adapter.addMessage(body);
     if (delivery) {
-      this.stats[slot].addOns += 1;
+      this.statsOf(slot).addOns += 1;
       this.store.appendVsAddOn(slot, body, delivery);
       return { delivery };
     }
@@ -182,7 +216,7 @@ export class VsRunner {
       throw new Error(`Slot ${slot.toUpperCase()} is finishing its last turn. Try again in a moment.`);
     }
 
-    this.stats[slot].addOns += 1;
+    this.statsOf(slot).addOns += 1;
     this.store.appendVsAddOn(slot, body, 'sent');
     // The cleanup is part of the promise handed back, not a chain hung off the
     // side of it. A caller awaiting `turn` and then asking `isRunning` has to
@@ -210,7 +244,7 @@ export class VsRunner {
     if (this.inflight[slot]) throw new Error(`Slot ${slot.toUpperCase()} is already working.`);
     this.store.appendVsFollowUp(slot, prompt);
     const pending = this.runSolo(
-      this.sides[slot],
+      this.sideFor(slot),
       prompt,
       `slot ${slot.toUpperCase()} follow-up`,
     );
@@ -260,7 +294,7 @@ export class VsRunner {
 
   /** What a slot's branch looks like now — for refreshing the board after a solo turn. */
   async diffFor(slot: SlotId): Promise<{ files: number; insertions: number; deletions: number }> {
-    const side = this.sides[slot];
+    const side = this.sideFor(slot);
     const diff = await diffSummary(this.root, side.worktree.base, side.worktree.branch);
     return { files: diff.files, insertions: diff.insertions, deletions: diff.deletions };
   }
@@ -273,7 +307,7 @@ export class VsRunner {
    * being compared on.
    */
   private beginExchange(slot: SlotId): () => number {
-    const stats = this.stats[slot];
+    const stats = this.statsOf(slot);
     const startedAt = Date.now();
     stats.runningSince = startedAt;
     return () => {
@@ -289,7 +323,7 @@ export class VsRunner {
     let turn: TurnResult;
     const done = this.beginExchange(side.slot);
     let elapsedMs = 0;
-    const addOnsBefore = this.stats[side.slot].addOns;
+    const addOnsBefore = this.statsOf(side.slot).addOns;
     try {
       turn = await side.adapter.send(query, 'shared VS request');
     } catch (error) {
@@ -334,12 +368,25 @@ export class VsRunner {
       response: turn.text,
       usage: turn.usage,
       elapsedMs,
-      addOns: this.stats[side.slot].addOns - addOnsBefore,
+      addOns: this.statsOf(side.slot).addOns - addOnsBefore,
       error: turn.error,
     };
   }
 }
 
-export function vsInstructions(slot: SlotId): string {
-  return `You are slot ${slot.toUpperCase()} in a doet VS run. Another coding agent receives the same request in a separate git worktree. Work independently: inspect the repository, make the requested changes in your current working tree, and verify them. Do not wait for or discuss the other agent. Your final response must stand alone and summarize what changed and how you verified it.`;
+/**
+ * The standing brief each isolated agent is given.
+ *
+ * `total` is stated rather than left vague because "another coding agent" reads
+ * very differently from "five other coding agents" — the first invites a
+ * comparison, the second makes plain that being one voice among several is the
+ * point. Either way the instruction is the same: work alone, finish, and write
+ * something that stands on its own.
+ */
+export function vsInstructions(slot: SlotId, total: number): string {
+  const others = total - 1;
+  const company = others <= 0
+    ? 'You are the only agent on this request.'
+    : `${others === 1 ? 'Another coding agent receives' : `${others} other coding agents receive`} the same request, each in a separate git worktree.`;
+  return `You are slot ${slot.toUpperCase()} in a doet VS run. ${company} Work independently: inspect the repository, make the requested changes in your current working tree, and verify them. Do not wait for or discuss the other agents. Your final response must stand alone and summarize what changed and how you verified it.`;
 }

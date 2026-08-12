@@ -18,7 +18,8 @@
     "build": "tsc && chmod +x dist/cli.js",
     "start": "node dist/cli.js",
     "typecheck": "tsc --noEmit",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "test": "npm run build && node test/run.mjs"
   },
   "keywords": [
     "cli",

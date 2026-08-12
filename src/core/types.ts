@@ -9,26 +9,78 @@
  * can see and type into, which is the better place for all three.
  */
 
-export type AgentId = 'claude' | 'codex';
-export type CliId = AgentId;
-export type SlotId = 'a' | 'b';
+/**
+ * The coding CLIs doet can drive.
+ *
+ * This list is the *only* place the set is written down. Everything that used
+ * to branch on "claude or codex" — the argv, the transcript reader, the recap,
+ * the labels, the colours — now asks a `CliDefinition` in `core/agents/`
+ * instead, so adding the next one is a new file in that directory rather than a
+ * new arm on eight `if` statements.
+ */
+export type CliId = 'claude' | 'codex' | 'cline' | 'kilo';
 
-export const AGENT_IDS: AgentId[] = ['claude', 'codex'];
-export const SLOT_IDS: SlotId[] = ['a', 'b'];
+/**
+ * The old name for `CliId`, kept because it reads better in the places that
+ * really are talking about an agent rather than about a program: the labels, the
+ * colours, the pricing table.
+ */
+export type AgentId = CliId;
 
-export function otherAgent(id: AgentId): AgentId {
-  return id === 'claude' ? 'codex' : 'claude';
+export const CLI_IDS: CliId[] = ['claude', 'codex', 'cline', 'kilo'];
+
+/**
+ * Which of the agents in a run this is — `a`, `b`, `c`…
+ *
+ * A plain string rather than `'a' | 'b'`, and that widening is the whole of
+ * DOET-004's second half. Two things forced it. VS now runs N agents rather
+ * than two, so the alphabet cannot be written out in a type. And co-code can
+ * now put the *same* CLI on both sides, so the CLI id is no longer a usable
+ * identity — two Claudes in one session are both `claude`, and every
+ * `Record<AgentId, …>` keyed on that silently collapses them into one.
+ *
+ * So the slot is the identity, everywhere, in both modes. The CLI is something
+ * a slot *has*.
+ */
+export type SlotId = string;
+
+/**
+ * Nine, and the limit is the keyboard rather than the machine.
+ *
+ * Each agent gets a tmux window, and the dashboard offers `F1`–`F9` and
+ * `alt+1`–`alt+9` to jump straight into one. `F10` and a two-digit alt binding
+ * both exist, but the first is taken by terminals often enough to be unreliable
+ * and the second cannot be told from the start of `alt+1` without a timeout. A
+ * tenth agent would have to be reached by a key that sometimes works, which is
+ * worse than not offering it.
+ */
+export const MAX_SLOTS = 9;
+
+const ALPHABET = 'abcdefghi';
+
+/** `['a', 'b', 'c']` for 3. Throws rather than truncating — see `MAX_SLOTS`. */
+export function slotIds(count: number): SlotId[] {
+  if (!Number.isInteger(count) || count < 1) {
+    throw new Error(`A run needs at least one agent, not ${count}.`);
+  }
+  if (count > MAX_SLOTS) {
+    throw new Error(`doet runs at most ${MAX_SLOTS} agents at once, not ${count}.`);
+  }
+  return ALPHABET.slice(0, count).split('');
 }
 
 /**
- * Both CLIs expose a reasoning-effort dial with the same five names, so doet
- * can offer one vocabulary. Claude takes it as `--effort`, Codex as a
- * `model_reasoning_effort` config override; either way it is fixed when the
- * session starts, which is also when doet asks for it.
+ * The reasoning-effort dial, where the CLI has one.
+ *
+ * These five names are Claude's and Codex's. They are *not* universal, which is
+ * why the supported set now lives on each `CliDefinition` rather than here:
+ * cline offers `none|low|medium|high|xhigh` — no `max` — and kilo has no dial at
+ * all, choosing effort per model instead. This union is the vocabulary doet
+ * displays; what any one CLI will actually accept is `supports.efforts`.
  */
-export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export type Effort = 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
-export const EFFORTS: Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+export const EFFORTS: Effort[] = ['none', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 /**
  * One selectable model.
@@ -98,18 +150,27 @@ export interface Usage {
  * through here — it is drawn by the CLI, in its pane. What is left is doet's
  * own voice: what it sent, what came back, what it cost, and what it is doing.
  */
+/**
+ * Note that every `agent` below is a `SlotId`, not a `CliId`.
+ *
+ * It used to be the CLI id, which worked only for as long as a session could
+ * not hold two of the same one. co-code can now be Claude against Claude, so
+ * "which agent said this" has exactly one answer that still means something:
+ * the slot. The field kept its name because that is what it is *for* — the
+ * agent in slot `b` — but what it carries is the slot.
+ */
 export type DoetEvent =
-  | { kind: 'status'; agent: AgentId; status: AgentStatus; note?: string }
+  | { kind: 'status'; agent: SlotId; status: AgentStatus; note?: string }
   /** A complete assistant message, read from the CLI's transcript. */
-  | { kind: 'message'; agent: AgentId; text: string }
-  | { kind: 'usage'; agent: AgentId; usage: Usage }
-  | { kind: 'error'; agent: AgentId; message: string; fatal?: boolean }
+  | { kind: 'message'; agent: SlotId; text: string }
+  | { kind: 'usage'; agent: SlotId; usage: Usage }
+  | { kind: 'error'; agent: SlotId; message: string; fatal?: boolean }
   /** The prompt doet handed this agent. */
-  | { kind: 'prompt'; agent: AgentId; text: string; label: string }
+  | { kind: 'prompt'; agent: SlotId; text: string; label: string }
   /** Adapter finished a turn. `text` is the full final assistant message. */
-  | { kind: 'turn-end'; agent: AgentId; text: string }
+  | { kind: 'turn-end'; agent: SlotId; text: string }
   /** A fresh underlying session was opened for one agent. */
-  | { kind: 'session'; agent: AgentId; sessionId?: string }
+  | { kind: 'session'; agent: SlotId; sessionId?: string }
   /**
    * This agent's pane has stopped moving mid-turn, so it is probably asking you
    * something. `note` is null when it starts moving again.
@@ -120,18 +181,18 @@ export type DoetEvent =
    * see. See `TmuxAgent`'s `stalled` handler for how it is worked out, and why
    * the answer is a guess rather than a fact.
    */
-  | { kind: 'attention'; agent: AgentId; note: string | null }
+  | { kind: 'attention'; agent: SlotId; note: string | null }
   /**
    * An agent's own account of what it just did, written in a fork of its own
    * session. `final` marks the closing summary of the whole run.
    */
-  | { kind: 'recap'; agent: AgentId; text: string; round: number; final?: boolean }
+  | { kind: 'recap'; agent: SlotId; text: string; round: number; final?: boolean }
   /** One agent used a doet tool to reach the other. */
-  | { kind: 'peer'; from: AgentId; to: AgentId; tool: string; note: string }
+  | { kind: 'peer'; from: SlotId; to: SlotId; tool: string; note: string }
   /** Conductor-level narration, shown in the relay log. */
-  | { kind: 'relay'; from: AgentId | 'user'; to: AgentId; round: number; note: string }
+  | { kind: 'relay'; from: SlotId | 'user'; to: SlotId; round: number; note: string }
   | { kind: 'debate'; phase: DebatePhase; round: number; note?: string }
-  | { kind: 'log'; source: AgentId | 'doet'; message: string; level?: 'info' | 'warn' | 'error' };
+  | { kind: 'log'; source: SlotId | 'doet'; message: string; level?: 'info' | 'warn' | 'error' };
 
 export type DebatePhase = 'idle' | 'opening' | 'exchanging' | 'converged' | 'done' | 'stopped';
 
@@ -162,7 +223,10 @@ export type InFlightDelivery = 'live';
 // ---------------------------------------------------------------------------
 
 export interface AgentInfo {
-  id: AgentId;
+  /** Which agent in the run this is. The identity — see `SlotId`. */
+  slot: SlotId;
+  /** Which program it is running. Two slots may well hold the same one. */
+  cli: CliId;
   label: string;
   /** The id handed to `--model`, or empty for the CLI's own default. */
   model: string;
@@ -187,7 +251,7 @@ export interface AgentInfo {
 }
 
 export interface TurnResult {
-  agent: AgentId;
+  agent: SlotId;
   /** Final assistant message, as the CLI recorded it. */
   text: string;
   verdict: Verdict | null;
@@ -221,6 +285,12 @@ export interface VsSlotResult {
 export interface VsResult {
   query: string;
   base: string;
+  /**
+   * The slots in the order they were laid out, because `Record` has no order
+   * and a scoreboard that lists B above A for no reason is a scoreboard nobody
+   * trusts. Every consumer iterates this and looks `slots` up by it.
+   */
+  order: SlotId[];
   slots: Record<SlotId, VsSlotResult>;
   /**
    * Wall clock for the run, which is the slower slot rather than the sum: both
@@ -251,7 +321,8 @@ export interface VsSlotStats {
  * hold in the first place.
  */
 export interface AgentAdapter {
-  readonly id: AgentId;
+  readonly slot: SlotId;
+  readonly cli: CliId;
   readonly label: string;
 
   start(): Promise<void>;

@@ -1,6 +1,6 @@
 import { resolveCost, totalTokens, type Cost, type PricingTable } from './pricing.js';
 import { AGENT_LABELS } from './relay.js';
-import { SLOT_IDS, type SlotId, type Usage, type VsResult, type VsSlotStats } from './types.js';
+import type { SlotId, Usage, VsResult, VsSlotStats } from './types.js';
 import { compactNumber, formatDuration, formatUsd } from './util.js';
 
 /**
@@ -84,11 +84,12 @@ export function formatScore(score: SlotScore, opts: { cost?: boolean } = {}): st
  * empty, which is otherwise indistinguishable from "free".
  */
 export function renderScoreboard(result: VsResult, pricing: PricingTable): string {
-  const rows = SLOT_IDS.map((slot) => {
+  const rows = result.order.flatMap((slot) => {
     const side = result.slots[slot];
+    if (!side) return [];
     const usage = side.usage;
     const cost = resolveCost(usage, side.model, pricing);
-    return [
+    return [[
       `Slot ${slot.toUpperCase()}`,
       `${AGENT_LABELS[side.cli]}${side.model ? ` · \`${side.model}\`` : ''}`,
       formatDuration(side.elapsedMs),
@@ -97,17 +98,18 @@ export function renderScoreboard(result: VsResult, pricing: PricingTable): strin
       compactNumber(totalTokens(usage)),
       formatCost(cost),
       side.addOns > 0 ? String(side.addOns) : '–',
-    ];
+    ]];
   });
 
   const header = '| | Agent | Time | In | Out | Total | Cost | Added |';
   const divider = '|---|---|---:|---:|---:|---:|---:|---:|';
   const unpriced = rows.some((row) => row[6] === '–');
+  const count = result.order.length;
 
   return [
     `## Spend\n`,
-    `Wall clock: ${formatDuration(result.elapsedMs)} — both slots ran at once, so this is`,
-    `the slower one rather than the sum.\n`,
+    `Wall clock: ${formatDuration(result.elapsedMs)} — ${count === 1 ? 'one slot' : `all ${count} slots`} ran at once, so this is`,
+    `the slowest ${count === 1 ? 'one' : 'of them'} rather than the sum.\n`,
     header,
     divider,
     ...rows.map((row) => `| ${row.join(' | ')} |`),

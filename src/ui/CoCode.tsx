@@ -3,9 +3,8 @@ import { Box, Text, useApp, useInput, useStdout } from 'ink';
 import type { Bus } from '../core/bus.js';
 import type { Conductor } from '../core/conductor.js';
 import type { SessionStore } from '../core/sessions.js';
-import { AGENT_LABELS } from '../core/relay.js';
 import { compactNumber } from '../core/util.js';
-import { AGENT_IDS, type AgentAdapter, type AgentId, type AgentInfo } from '../core/types.js';
+import type { AgentAdapter, AgentInfo, CliId, SlotId } from '../core/types.js';
 import { Composer } from './Composer.js';
 import { Picker } from './Picker.js';
 import { AGENT_COLOR, SPINNER } from './theme.js';
@@ -13,7 +12,9 @@ import { AGENT_COLOR, SPINNER } from './theme.js';
 interface Props {
   bus: Bus;
   conductor: Conductor;
-  agents: Record<AgentId, AgentAdapter>;
+  agents: Record<SlotId, AgentAdapter>;
+  /** The two participants, left to right on screen. */
+  order: SlotId[];
   store: SessionStore;
   defaultRounds: number;
 }
@@ -21,7 +22,7 @@ interface Props {
 interface Line {
   id: number;
   text: string;
-  from?: AgentId | 'user' | 'doet';
+  from?: SlotId | 'user' | 'doet';
   tone: 'info' | 'warn' | 'error' | 'good';
 }
 
@@ -33,24 +34,6 @@ const ROUND_NOTE: Record<number, string> = {
   2: 'One answer and one review. Enough for a small check.',
   12: 'For work that will genuinely take the back-and-forth.',
 };
-
-/**
- * Where each party sits on screen: Claude left, doet centre, Codex right.
- *
- * The relay line is written in that order rather than in sender-first order, so
- * it reads as the movement you are watching. `you → Claude Code` described the
- * same event but pointed the wrong way across the screen, since Claude's pane
- * is to doet's *left*.
- */
-const POSITION: Record<AgentId | 'user', number> = { claude: 0, user: 1, codex: 2 };
-
-function describeFlow(from: AgentId | 'user', to: AgentId | 'user'): string {
-  const name = (who: AgentId | 'user') => (who === 'user' ? 'you' : AGENT_LABELS[who]);
-  // Left-to-right on screen, with the arrow pointing the way it travelled.
-  return POSITION[from] < POSITION[to]
-    ? `${name(from)} ──▶ ${name(to)}`
-    : `${name(to)} ◀── ${name(from)}`;
-}
 
 const TONE: Record<Line['tone'], string | undefined> = {
   info: undefined,
@@ -68,7 +51,31 @@ const TONE: Record<Line['tone'], string | undefined> = {
  * and one place to type — either a new question, or a note that reaches
  * whoever speaks next.
  */
-export function CoCode({ bus, conductor, agents, store, defaultRounds }: Props) {
+export function CoCode({ bus, conductor, agents, order, store, defaultRounds }: Props) {
+  const [left, right] = order as [SlotId, SlotId];
+  /**
+   * Where each party sits on screen: the first agent left, doet centre, the
+   * second right. Derived from `order` rather than from the CLI id, since both
+   * sides can now be running the same program.
+   */
+  const position = useCallback(
+    (who: SlotId | 'user'): number => (who === 'user' ? 1 : who === left ? 0 : 2),
+    [left],
+  );
+  const nameOf = useCallback(
+    (who: SlotId | 'user'): string => (who === 'user' ? 'you' : conductor.labelFor(who)),
+    [conductor],
+  );
+  const cliOf = useCallback(
+    (slot: SlotId): CliId => agents[slot]?.cli ?? 'claude',
+    [agents],
+  );
+  const describeFlow = useCallback((from: SlotId | 'user', to: SlotId | 'user'): string =>
+    // Left-to-right on screen, with the arrow pointing the way it travelled.
+    position(from) < position(to)
+      ? `${nameOf(from)} ──▶ ${nameOf(to)}`
+      : `${nameOf(to)} ◀── ${nameOf(from)}`,
+  [nameOf, position]);
   const { exit } = useApp();
   const { stdout } = useStdout();
   const [cols, setCols] = useState(stdout.columns ?? 100);
@@ -76,11 +83,10 @@ export function CoCode({ bus, conductor, agents, store, defaultRounds }: Props) 
 
   const [input, setInput] = useState('');
   const [lines, setLines] = useState<Line[]>([]);
-  const [infos, setInfos] = useState<Record<AgentId, AgentInfo>>({
-    claude: agents.claude.info(),
-    codex: agents.codex.info(),
-  });
-  const [active, setActive] = useState<AgentId | null>(null);
+  const [infos, setInfos] = useState<Record<SlotId, AgentInfo>>(() =>
+    Object.fromEntries(order.map((slot) => [slot, agents[slot]!.info()])),
+  );
+  const [active, setActive] = useState<SlotId | null>(null);
   const [round, setRound] = useState(0);
   const [running, setRunning] = useState(false);
   /** The closing account of the run, from whoever spoke last. */
@@ -99,9 +105,9 @@ export function CoCode({ bus, conductor, agents, store, defaultRounds }: Props) 
   const [roundIndex, setRoundIndex] = useState(0);
   const [spinner, setSpinner] = useState(0);
   const pending = useRef('');
-  const opener = useRef<AgentId>('claude');
+  const opener = useRef<SlotId>(order[0]!);
   /** Which way the last relay travelled, for the arrow between the panes. */
-  const [flow, setFlow] = useState<{ from: AgentId; to: AgentId } | null>(null);
+  const [flow, setFlow] = useState<{ from: SlotId; to: SlotId } | null>(null);
   const lineId = useRef(0);
   const quitting = useRef(false);
 
@@ -137,7 +143,10 @@ export function CoCode({ bus, conductor, agents, store, defaultRounds }: Props) 
       case 'usage':
       case 'turn-end':
       case 'session':
-        setInfos((previous) => ({ ...previous, [event.agent]: agents[event.agent].info() }));
+        setInfos((previous) => {
+          const adapter = agents[event.agent];
+          return adapter ? { ...previous, [event.agent]: adapter.info() } : previous;
+        });
         break;
       case 'relay':
         setRound(event.round);
@@ -152,7 +161,7 @@ export function CoCode({ bus, conductor, agents, store, defaultRounds }: Props) 
         // An agent reached the other one through a doet tool rather than
         // waiting for the relay. Worth showing: it is the one thing that
         // happens in this session that neither pane explains on its own.
-        say(`${AGENT_LABELS[event.from]} → ${AGENT_LABELS[event.to]} · ${event.tool}: ${event.note}`, 'good', event.from);
+        say(`${nameOf(event.from)} → ${nameOf(event.to)} · ${event.tool}: ${event.note}`, 'good', event.from);
         break;
       case 'recap':
         // The agent's own line about the turn it just took. It is written for
@@ -160,7 +169,7 @@ export function CoCode({ bus, conductor, agents, store, defaultRounds }: Props) 
         // itself, so a summary of it would be doet paraphrasing a message it is
         // already passing on in full.
         if (event.final) setSummary(event.text);
-        else say(`${AGENT_LABELS[event.agent]}: ${event.text}`, 'info', event.agent);
+        else say(`${nameOf(event.agent)}: ${event.text}`, 'info', event.agent);
         break;
       case 'error':
         say(event.message, 'error', event.agent);
@@ -171,29 +180,29 @@ export function CoCode({ bus, conductor, agents, store, defaultRounds }: Props) 
       default:
         break;
     }
-  }), [agents, bus, say]);
+  }), [agents, bus, describeFlow, nameOf, say]);
 
-  const start = useCallback((query: string, first: AgentId, howMany: number) => {
+  const start = useCallback((query: string, first: SlotId, howMany: number) => {
     setRunning(true);
-    setNotice(`${AGENT_LABELS[first]} answers first · ${howMany} exchange${howMany === 1 ? '' : 's'}`);
+    setNotice(`${nameOf(first)} answers first · ${howMany} exchange${howMany === 1 ? '' : 's'}`);
     setFlow(null);
     // The last run's closing line belongs to the last run.
     setSummary('');
     void conductor.run(query, first, howMany).then((result) => {
       setRunning(false);
       setFlow(null);
-      store.snapshot({ claude: agents.claude.history(), codex: agents.codex.history() });
+      store.snapshot(order.map((slot) => ({ slot, label: conductor.labelFor(slot), markdown: agents[slot]!.history() })));
       say(
-        `done — ${result.rounds} exchange${result.rounds === 1 ? '' : 's'}, ${result.reason}. Final answer from ${AGENT_LABELS[result.finalFrom]}.`,
+        `done — ${result.rounds} exchange${result.rounds === 1 ? '' : 's'}, ${result.reason}. Final answer from ${nameOf(result.finalFrom)}.`,
         result.reason === 'error' ? 'error' : 'good',
       );
-      setNotice(`Saved in ${store.dir} — the final answer is in ${result.finalFrom}'s pane.`);
+      setNotice(`Saved in ${store.dir} — the final answer is in ${nameOf(result.finalFrom)}'s pane.`);
     }).catch((error: unknown) => {
       setRunning(false);
       setFlow(null);
       setNotice(error instanceof Error ? error.message : String(error));
     });
-  }, [agents, conductor, say, store]);
+  }, [agents, conductor, nameOf, order, say, store]);
 
   const shutdown = useCallback(async () => {
     if (quitting.current) {
@@ -206,10 +215,10 @@ export function CoCode({ bus, conductor, agents, store, defaultRounds }: Props) 
       await conductor.abort();
       await conductor.whenIdle();
     }
-    store.snapshot({ claude: agents.claude.history(), codex: agents.codex.history() });
+    store.snapshot(order.map((slot) => ({ slot, label: conductor.labelFor(slot), markdown: agents[slot]!.history() })));
     store.detach();
     exit();
-  }, [agents, conductor, exit, store]);
+  }, [agents, conductor, exit, order, store]);
 
   useInput((char, key) => {
     if (key.ctrl && char === 'c') {
@@ -218,7 +227,7 @@ export function CoCode({ bus, conductor, agents, store, defaultRounds }: Props) 
     }
     if (choosing === 'first') {
       if (char === '1' || char === '2') {
-        opener.current = char === '1' ? 'claude' : 'codex';
+        opener.current = char === '1' ? left : right;
         setChoosing('rounds');
         setRoundIndex(Math.max(0, ROUND_CHOICES.indexOf(rounds)));
       } else if (key.escape) {
@@ -289,15 +298,15 @@ export function CoCode({ bus, conductor, agents, store, defaultRounds }: Props) 
       </Box>
 
       <Box paddingX={1} width={cols} flexWrap="nowrap" overflow="hidden">
-        {AGENT_IDS.map((id) => (
-          <Box key={id} flexShrink={0} marginRight={2}>
-            <Text color={AGENT_COLOR[id]} bold={active === id}>
-              {active === id ? '▸ ' : '  '}{AGENT_LABELS[id]}
+        {order.map((slot) => (
+          <Box key={slot} flexShrink={0} marginRight={2}>
+            <Text color={AGENT_COLOR[cliOf(slot)]} bold={active === slot}>
+              {active === slot ? '▸ ' : '  '}{conductor.labelFor(slot)}
             </Text>
             <Text dimColor>
-              {' '}{infos[id].model || 'default'}
-              {infos[id].effort ? `/${infos[id].effort}` : ''}
-              {infos[id].usage.outputTokens != null ? ` · ${compactNumber(infos[id].usage.outputTokens)}` : ''}
+              {' '}{infos[slot]?.model || 'default'}
+              {infos[slot]?.effort ? `/${infos[slot]?.effort}` : ''}
+              {infos[slot]?.usage.outputTokens != null ? ` · ${compactNumber(infos[slot]?.usage.outputTokens)}` : ''}
             </Text>
           </Box>
         ))}
@@ -307,7 +316,7 @@ export function CoCode({ bus, conductor, agents, store, defaultRounds }: Props) 
         {visible.map((line) => (
           <Text
             key={line.id}
-            color={TONE[line.tone] ?? (line.from && line.from !== 'user' && line.from !== 'doet' ? AGENT_COLOR[line.from] : undefined)}
+            color={TONE[line.tone] ?? (line.from && line.from !== 'user' && line.from !== 'doet' ? AGENT_COLOR[cliOf(line.from)] : undefined)}
             wrap="truncate-end"
           >
             {line.text}
@@ -321,16 +330,16 @@ export function CoCode({ bus, conductor, agents, store, defaultRounds }: Props) 
       {flow && running && (() => {
         // Drawn in screen order — left party, arrow, right party — so the line
         // matches the movement you are watching between the panes either side.
-        const rightward = POSITION[flow.from] < POSITION[flow.to];
-        const left = rightward ? flow.from : flow.to;
-        const right = rightward ? flow.to : flow.from;
+        const rightward = position(flow.from) < position(flow.to);
+        const from = rightward ? flow.from : flow.to;
+        const to = rightward ? flow.to : flow.from;
         return (
           <Box paddingX={1} width={cols} flexWrap="nowrap" overflow="hidden">
-            <Text color={AGENT_COLOR[left]} bold>{AGENT_LABELS[left]}</Text>
-            <Text color={rightward ? AGENT_COLOR[flow.to] : AGENT_COLOR[flow.from]} bold>
+            <Text color={AGENT_COLOR[cliOf(from)]} bold>{nameOf(from)}</Text>
+            <Text color={rightward ? AGENT_COLOR[cliOf(flow.to)] : AGENT_COLOR[cliOf(flow.from)]} bold>
               {rightward ? ' ──▶ ' : ' ◀── '}
             </Text>
-            <Text color={AGENT_COLOR[right]} bold>{AGENT_LABELS[right]}</Text>
+            <Text color={AGENT_COLOR[cliOf(to)]} bold>{nameOf(to)}</Text>
             <Text dimColor> · carrying the answer</Text>
           </Box>
         );
@@ -339,7 +348,7 @@ export function CoCode({ bus, conductor, agents, store, defaultRounds }: Props) 
       {choosing === 'rounds' && (
         <Box paddingX={1}>
           <Picker
-            title={`How many exchanges? — ${AGENT_LABELS[opener.current]} answers first`}
+            title={`How many exchanges? — ${nameOf(opener.current)} answers first`}
             items={ROUND_CHOICES.map((n) => ({
               id: String(n),
               label: n === 1 ? 'Just one answer' : `${n} exchanges`,
@@ -363,8 +372,13 @@ export function CoCode({ bus, conductor, agents, store, defaultRounds }: Props) 
       <Composer
         value={input}
         choosingFirst={choosing === 'first'}
+        openers={order.map((slot, index) => ({
+          key: String(index + 1),
+          label: conductor.labelFor(slot),
+          cli: cliOf(slot),
+        }))}
         phase={running ? 'exchanging' : 'idle'}
-        active={active}
+        active={active ? cliOf(active) : null}
         width={cols}
         hint={
           running
