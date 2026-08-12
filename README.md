@@ -84,6 +84,7 @@ copy uses, so the two cannot disturb each other.
 doet                                  # pick co-code or vs at launch
 doet --mode co-code                   # the original relayed conversation
 doet --mode vs                        # two isolated implementations
+doet --ui modern                      # agents filed under their names, not on screen
 doet --rounds 8 --first codex
 doet -C ~/projects/api --claude-model opus --claude-effort high
 doet --summary codex --summary-model gpt-5.4-mini
@@ -152,6 +153,57 @@ and always straight away. See [Messaging one slot](#messaging-one-slot).
 | `/quit` | exit |
 
 Everything you set this way persists to `~/.doet/config.json`.
+
+## Interfaces
+
+There are two, and the difference is only what is on your screen. The agents are
+the same real CLIs in the same real terminals either way.
+
+**interactive** is the original. Both agents are live, either side of doet, and
+you watch the work happen. Nothing is hidden, and nothing needs opening — at the
+cost of each agent getting a third of your terminal to render into.
+
+**modern** gives doet the whole terminal and files each agent in a tmux window of
+its own, named but not shown. What you read is the shape of the conversation:
+
+```
+ doet · co-code · exchange 2/4 · Claude Code answers first · 4 exchanges
+   Claude Code F1 sonnet · 12.4k   ▸ Codex F2 gpt-5 · 8.1k ⚠ waiting for you
+ ───────────────────────────────────────────────────────────────────────────────
+ you              refactor the auth module
+   Claude Code    ◀── you           read 3 files, rewrote auth.ts
+ ▾ Codex          ◀── Claude Code   ⠹ deliberating…
+```
+
+Each agent line is a door. Click it, or walk to it with `↑`/`↓` and press `tab`,
+and you are in that session — the real one, with its scrollback and its composer,
+at the full width of your terminal, which is what it has been rendering at all
+along.
+
+You do not close an agent to leave it; it goes on running and you switch away.
+`F12` returns to doet from anywhere, `F1` and `F2` go straight to an agent —
+including from inside the other one — and each agent's border carries the way
+back, since once you are in there doet's own screen is not visible to remind you.
+`alt+0` / `alt+1` / `alt+2` are bound to the same windows, and tmux's prefix
+(`ctrl+b` then a window number) always works. Prefer the function keys: on a
+stock macOS terminal Option is not Meta, so `alt+…` does nothing until you enable
+it — `terminal.integrated.macOptionIsMeta` in VS Code and Cursor, Left Option →
+`Esc+` in iTerm2, "Use Option as Meta Key" in Terminal.app.
+
+The one thing the modern view has to do for you is notice when a hidden agent has
+stopped. co-code runs with permission prompts on, and an agent waiting for your
+approval in a window you cannot see looks exactly like an agent thinking hard. So
+when both the transcript and the pane have been still for six seconds, its name is
+flagged `⚠ waiting for you`. It is a guess — doet reads transcripts, it does not
+watch panes — but it is the difference between looking and waiting.
+
+Choose it at launch, with `--ui`, or in `~/.doet/config.json`; whatever you pick
+is remembered. Modern is co-code only for now — a VS run says so and opens the
+interactive layout.
+
+Clicking needs mouse reporting, which means your terminal's own text selection is
+off inside doet's pane while it runs. Hold `option` (or `shift`) to select as
+usual.
 
 ## Messaging one slot
 

@@ -1,10 +1,12 @@
 /**
  * doet — shared vocabulary.
  *
- * Claude Code and Codex expose very different wire protocols (an SDK async
- * generator vs. JSON-RPC over stdio). Everything above the adapter layer speaks
- * only the types in this file, so adding a third agent later means writing one
- * adapter and touching nothing else.
+ * doet runs each agent as its real terminal program in a tmux pane and reads
+ * what it did from the transcript that CLI writes. So this file is smaller than
+ * it used to be, and the things missing from it are missing on purpose:
+ * permission prompts, session rotation and session handover were all doet's
+ * problem only while doet was the client. The CLI owns them now, in a pane you
+ * can see and type into, which is the better place for all three.
  */
 
 export type AgentId = 'claude' | 'codex';
@@ -20,24 +22,25 @@ export function otherAgent(id: AgentId): AgentId {
 
 /**
  * Both CLIs expose a reasoning-effort dial with the same five names, so doet
- * can offer one vocabulary. Which levels a given model actually accepts comes
- * back on the `ModelChoice`, not from this list.
+ * can offer one vocabulary. Claude takes it as `--effort`, Codex as a
+ * `model_reasoning_effort` config override; either way it is fixed when the
+ * session starts, which is also when doet asks for it.
  */
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 export const EFFORTS: Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 /**
- * One selectable model, as the agent's own CLI describes it.
+ * One selectable model.
  *
- * doet used to keep models as bare strings, which is why picking one barely
- * worked: there was nothing to validate a typo against and nothing to show but
- * the raw id. Both CLIs already publish this much detail — Claude through the
- * SDK's `supportedModels()`, Codex through `model/list` — so doet asks instead
- * of guessing.
+ * Neither CLI publishes its model list to the command line, so this is no
+ * longer discovered — it is whatever the user put in `~/.doet/config.json`,
+ * exactly like `pricing`. doet passes the id straight to `--model`; if it is
+ * wrong the CLI says so in its own pane, which is a better error than any doet
+ * could invent from a list it could not verify.
  */
 export interface ModelChoice {
-  /** The value handed back to `setModel`. */
+  /** The value handed to `--model`. */
   id: string;
   label: string;
   description?: string;
@@ -47,73 +50,29 @@ export interface ModelChoice {
   isDefault?: boolean;
 }
 
-export type AgentStatus =
-  | 'stopped'
-  | 'starting'
-  | 'ready'
-  | 'thinking'
-  | 'working'
-  | 'awaiting-permission'
-  | 'error';
+export type AgentStatus = 'stopped' | 'starting' | 'ready' | 'thinking' | 'working' | 'error';
 
-/** Where an agent stands in the debate right now. */
+/**
+ * Which of doet's two interfaces to draw.
+ *
+ * `interactive` is the original: every agent live on screen at once, doet's own
+ * pane between them. You see everything, and you see it in a third of the width.
+ *
+ * `modern` gives doet the whole terminal and files each agent in a tmux window
+ * of its own, named but not shown. What you read is the shape of the
+ * conversation — who has it, which way it went, what each turn came to — and any
+ * agent is one keypress away when you want the real thing.
+ *
+ * This is a preference about *display*, and deliberately nothing else. The
+ * agents are the same real CLIs in the same real terminals either way, so
+ * nothing below the UI layer branches on it.
+ */
+export type UiMode = 'interactive' | 'modern';
+
+export const UI_MODES: UiMode[] = ['interactive', 'modern'];
+
+/** Where an agent stands in a co-code exchange. */
 export type Verdict = 'AGREE' | 'REVISE';
-
-// ---------------------------------------------------------------------------
-// Permissions
-// ---------------------------------------------------------------------------
-
-export type PermissionKind =
-  | 'exec' // run a shell command
-  | 'edit' // write / patch files
-  | 'tool' // generic tool call (MCP, web, etc.)
-  | 'grant' // broaden the session's standing permissions
-  | 'input'; // agent is asking the user a question
-
-export interface PermissionOption {
-  /** Stable id handed back to the adapter, which maps it to a native decision. */
-  id: string;
-  label: string;
-  /** Single character the user presses. */
-  key: string;
-  tone?: 'allow' | 'deny' | 'danger';
-}
-
-export interface PermissionRequest {
-  id: string;
-  agent: AgentId;
-  kind: PermissionKind;
-  /** Tool or capability name, e.g. `Bash`, `shell`, `apply_patch`. */
-  title: string;
-  /** One-line gist — the command, the file path. */
-  summary: string;
-  /** Full payload: the diff, the argument object, the reason. */
-  detail?: string;
-  /** Why the agent says it needs this. */
-  reason?: string;
-  cwd?: string;
-  options: PermissionOption[];
-  createdAt: number;
-}
-
-export const ALLOW_ONCE: PermissionOption = {
-  id: 'allow',
-  label: 'Allow once',
-  key: 'a',
-  tone: 'allow',
-};
-export const ALLOW_SESSION: PermissionOption = {
-  id: 'allow_session',
-  label: 'Allow for session',
-  key: 's',
-  tone: 'allow',
-};
-export const DENY: PermissionOption = {
-  id: 'deny',
-  label: 'Deny',
-  key: 'd',
-  tone: 'deny',
-};
 
 // ---------------------------------------------------------------------------
 // Events
@@ -132,60 +91,49 @@ export interface Usage {
   costUsd?: number;
 }
 
+/**
+ * What doet still publishes on its own bus.
+ *
+ * Far less than before, because the agents' own output no longer travels
+ * through here — it is drawn by the CLI, in its pane. What is left is doet's
+ * own voice: what it sent, what came back, what it cost, and what it is doing.
+ */
 export type DoetEvent =
   | { kind: 'status'; agent: AgentId; status: AgentStatus; note?: string }
-  /** Streaming assistant text. */
-  | { kind: 'text'; agent: AgentId; delta: string }
-  /** A complete assistant message (authoritative; supersedes accumulated deltas). */
+  /** A complete assistant message, read from the CLI's transcript. */
   | { kind: 'message'; agent: AgentId; text: string }
-  /** Streaming reasoning/thinking summary. */
-  | { kind: 'thinking'; agent: AgentId; delta: string }
-  | {
-      kind: 'tool';
-      agent: AgentId;
-      id: string;
-      name: string;
-      summary: string;
-      phase: 'start' | 'end';
-      ok?: boolean;
-      result?: string;
-    }
-  /** Live stdout/stderr from a running command. */
-  | { kind: 'output'; agent: AgentId; id: string; chunk: string }
-  | { kind: 'permission'; agent: AgentId; request: PermissionRequest }
-  | {
-      kind: 'permission-resolved';
-      agent: AgentId;
-      id: string;
-      optionId: string;
-      label: string;
-    }
   | { kind: 'usage'; agent: AgentId; usage: Usage }
   | { kind: 'error'; agent: AgentId; message: string; fatal?: boolean }
-  /**
-   * The prompt doet is about to hand this agent. Panes render it so each window
-   * shows both halves of that agent's conversation, not just its replies.
-   */
+  /** The prompt doet handed this agent. */
   | { kind: 'prompt'; agent: AgentId; text: string; label: string }
   /** Adapter finished a turn. `text` is the full final assistant message. */
   | { kind: 'turn-end'; agent: AgentId; text: string }
   /** A fresh underlying session was opened for one agent. */
-  | { kind: 'session'; agent: AgentId; sessionId?: string; carried: HandoffMode }
-  /** The summary agent published a new rolling gist. */
-  | { kind: 'gist'; text: string; round: number }
+  | { kind: 'session'; agent: AgentId; sessionId?: string }
+  /**
+   * This agent's pane has stopped moving mid-turn, so it is probably asking you
+   * something. `note` is null when it starts moving again.
+   *
+   * Only the modern UI has any use for this, and only because that UI is what
+   * hides the pane in the first place. In the interactive UI the prompt is on
+   * screen and an event about it would be doet narrating what you can already
+   * see. See `TmuxAgent`'s `stalled` handler for how it is worked out, and why
+   * the answer is a guess rather than a fact.
+   */
+  | { kind: 'attention'; agent: AgentId; note: string | null }
+  /**
+   * An agent's own account of what it just did, written in a fork of its own
+   * session. `final` marks the closing summary of the whole run.
+   */
+  | { kind: 'recap'; agent: AgentId; text: string; round: number; final?: boolean }
+  /** One agent used a doet tool to reach the other. */
+  | { kind: 'peer'; from: AgentId; to: AgentId; tool: string; note: string }
   /** Conductor-level narration, shown in the relay log. */
   | { kind: 'relay'; from: AgentId | 'user'; to: AgentId; round: number; note: string }
   | { kind: 'debate'; phase: DebatePhase; round: number; note?: string }
   | { kind: 'log'; source: AgentId | 'doet'; message: string; level?: 'info' | 'warn' | 'error' };
 
-export type DebatePhase =
-  | 'idle'
-  | 'opening'
-  | 'exchanging'
-  | 'converged'
-  | 'synthesizing'
-  | 'done'
-  | 'stopped';
+export type DebatePhase = 'idle' | 'opening' | 'exchanging' | 'converged' | 'done' | 'stopped';
 
 // ---------------------------------------------------------------------------
 // One-time messages
@@ -194,62 +142,20 @@ export type DebatePhase =
 /**
  * What happened to a message you sent one agent.
  *
- * All three mean it reached that agent and nothing else did; they differ only
- * in whether there was work in progress to fold it into. Nothing is ever held
- * back waiting for something else to happen — a message you send is a message
- * that has been sent.
+ * `live`  — pasted into the composer of a session that is mid-turn, which both
+ *           CLIs accept and fold into the work in progress.
+ * `sent`  — the agent was idle, so the message is simply its next turn.
  *
- * `live`   — pushed into the running session there and then. When the CLI reads
- *            it is the CLI's call, but the message is already in its hands, so
- *            a long agentic turn can pick it up between steps.
- * `queued` — the protocol has no channel into a running turn at all, so doet
- *            holds the message for the few seconds until that turn ends.
- * `sent`   — the agent was idle, so the message is simply its next turn, opened
- *            immediately.
- *
- * For the first two the exchange stays open until the agent has answered the
- * added message as well, so the result covers the request and the amendment.
+ * `queued` is gone: nothing is held back any more. Pasting into a running
+ * composer is exactly what you would do yourself, and it always lands.
  */
-export type MessageDelivery = 'live' | 'queued' | 'sent';
+export type MessageDelivery = 'live' | 'sent';
 
 /**
  * What an adapter managed on its own. `null` means there was no exchange in
- * flight to add to, and the caller should open a turn instead — a decision the
- * adapter deliberately does not make for it, since only the caller knows what
- * else that would disturb.
+ * flight to add to, and the caller should open a turn instead.
  */
-export type InFlightDelivery = 'live' | 'queued';
-
-// ---------------------------------------------------------------------------
-// Sessions
-// ---------------------------------------------------------------------------
-
-/**
- * What to carry into a freshly opened agent session.
- *
- * `gist` is the summary agent's rolling digest — small, and the reason the
- * summary agent exists. `full` is the agent's complete transcript so far, which
- * is faithful but re-pays for every token. `none` is a deliberate clean slate.
- */
-export type HandoffMode = 'gist' | 'full' | 'none';
-
-/**
- * When to retire an agent's session and open a new one. Long sessions drift and
- * get expensive; short ones forget. Neither default is right for everyone, so
- * this is the user's dial.
- */
-export type SessionPolicy =
-  | { mode: 'manual' }
-  /** Rotate every N exchanges by that agent. */
-  | { mode: 'rounds'; every: number }
-  /** Rotate once the agent's session passes this many total tokens. */
-  | { mode: 'tokens'; limit: number };
-
-export interface AgentSessionSettings {
-  policy: SessionPolicy;
-  /** `ask` stops and prompts; the rest apply without interrupting. */
-  handoff: HandoffMode | 'ask';
-}
+export type InFlightDelivery = 'live';
 
 // ---------------------------------------------------------------------------
 // Adapter contract
@@ -258,32 +164,32 @@ export interface AgentSessionSettings {
 export interface AgentInfo {
   id: AgentId;
   label: string;
-  /** The id the user picked — what `/model` set and what config persists. */
+  /** The id handed to `--model`, or empty for the CLI's own default. */
   model: string;
-  /**
-   * What the CLI says it actually resolved that to (`sonnet` → `claude-sonnet-5`).
-   * Kept apart from `model` on purpose: overwriting the requested id with the
-   * resolved one used to make the selection un-round-trippable.
-   */
-  resolvedModel?: string;
   effort?: Effort;
   status: AgentStatus;
   cwd: string;
-  /** Native permission/approval posture, phrased in the agent's own terms. */
-  permissionMode: string;
+  /** The CLI's session id, once its transcript exists. */
   sessionId?: string;
-  /** Bumped every time a new underlying session is opened. */
   sessionSeq: number;
-  /** Turns taken in the *current* session, which is what a rounds policy counts. */
   sessionTurns: number;
   usage: Usage;
+  /**
+   * The tmux window holding this agent, when it has one to itself.
+   *
+   * Set only under the modern UI, which is the only arrangement where an agent
+   * lives somewhere you have to be taken to. In the interactive layout every
+   * agent shares doet's window and there is nowhere to go.
+   */
+  window?: number;
+  /** Why this agent might need you, or absent when it does not. See `attention`. */
+  attention?: string;
 }
 
 export interface TurnResult {
   agent: AgentId;
-  /** Final assistant message, with any doet control markers stripped. */
+  /** Final assistant message, as the CLI recorded it. */
   text: string;
-  /** Verdict parsed out of the control marker, if the agent emitted one. */
   verdict: Verdict | null;
   usage: Usage;
   interrupted: boolean;
@@ -293,7 +199,6 @@ export interface TurnResult {
 export interface VsSlotResult {
   slot: SlotId;
   cli: CliId;
-  /** What the CLI resolved to, so a saved result can still be priced later. */
   model: string;
   branch: string;
   worktree: string;
@@ -327,15 +232,9 @@ export interface VsResult {
 /**
  * What one slot has spent so far — read live by the UI while a run is in
  * flight, and folded into `VsSlotResult` when it finishes.
- *
- * `activeMs` is time spent inside exchanges, not since the slot started, so a
- * slot you left idle for ten minutes does not look like it worked for ten
- * minutes.
  */
 export interface VsSlotStats {
-  /** Exchanges this slot has completed. */
   turns: number;
-  /** One-time messages added to this slot's exchanges. */
   addOns: number;
   activeMs: number;
   /** Set while an exchange is in flight; the UI counts up from it. */
@@ -343,80 +242,37 @@ export interface VsSlotStats {
   usage: Usage;
 }
 
+/**
+ * What doet asks of an agent.
+ *
+ * Deliberately small. Everything doet used to do *to* a session — approve its
+ * tools, rotate it, release it so you could take it over — either belongs to
+ * the CLI now or stopped meaning anything once the session was never doet's to
+ * hold in the first place.
+ */
 export interface AgentAdapter {
   readonly id: AgentId;
   readonly label: string;
 
   start(): Promise<void>;
-  /**
-   * Send one user turn and resolve when the agent finishes responding.
-   * `label` is what the pane shows above the prompt it renders.
-   */
+  /** Send one user turn and resolve when the agent finishes responding. */
   send(prompt: string, label?: string): Promise<TurnResult>;
   /**
    * Add one message to the exchange this agent is in the middle of.
    *
-   * Distinct from `send`, which starts an exchange and is refused while one is
-   * running. This is the "I forgot to say" channel: the agent is already
-   * working, you have thought of something, and waiting for it to finish means
-   * correcting the wrong implementation instead of steering the right one.
-   *
-   * Whether the agent can hear you *now* or only at the next turn boundary is
-   * the CLI's business, not the caller's, so the promise resolves with which of
-   * the two happened. Either way the exchange stays open until the agent has
-   * answered the added message, so `send`'s result covers the whole thing.
-   *
-   * Resolves `null` when no exchange was in flight. It deliberately does not
-   * fall back to opening one: nothing is stored, nothing is deferred, and the
-   * caller sends the message as an ordinary turn instead.
+   * Resolves `null` when no exchange was in flight, so the caller can send it
+   * as an ordinary turn instead.
    */
   addMessage(text: string): Promise<InFlightDelivery | null>;
   interrupt(): Promise<void>;
-  /** Answer a pending permission request by option id. */
-  resolvePermission(requestId: string, optionId: string): void;
-  /** Throws if the model is not one this account can run. */
+  /** Only before the session starts; the CLI takes its model as a launch flag. */
   setModel(model: string, effort?: Effort): Promise<void>;
-  /** Models this agent will accept for `setModel`, as its own CLI reports them. */
   listModels(): Promise<ModelChoice[]>;
-  setPermissionMode(mode: string): Promise<void>;
-  listPermissionModes(): string[];
-  /** Move subsequent opens/resumes to another working tree. Never changes it mid-turn. */
+  /** Move to another working tree, restarting the CLI there on the same session. */
   setCwd(cwd: string): Promise<void>;
-  /**
-   * Retire the current session and open a fresh one. `carry` is prepended to
-   * the next prompt rather than sent as a turn of its own, so a handoff costs
-   * no extra round-trip.
-   */
-  newSession(carry?: string, carried?: HandoffMode): Promise<void>;
-  /**
-   * Drop the live session so something else can own it, returning the id needed
-   * to get it back. Null when there is no resumable session yet.
-   *
-   * This exists for the pane handover: two processes writing the same session
-   * at once corrupts it, so doet lets go before the interactive CLI takes over.
-   */
-  releaseSession(): Promise<string | null>;
-  /**
-   * Re-attach to a session id — including one an interactive CLI has since
-   * added turns to. The agent keeps whatever happened while doet was away.
-   */
-  resumeSession(sessionId: string): Promise<void>;
-  /**
-   * How to open this agent's current session in its own interactive CLI, or
-   * null if there is nothing to open yet.
-   */
-  interactiveCommand(): { command: string; args: string[] } | null;
-  /**
-   * Branch the session and return the command that opens the branch, leaving
-   * the live one untouched and running.
-   *
-   * This is the other half of `releaseSession`. Neither CLI can have one
-   * session written by two processes at once, so there are exactly two honest
-   * options: hand the session over (doet lets go, work comes back), or fork it
-   * (nothing stops, work stays on the branch).
-   */
+  /** Branch the session, returning the command that opens the branch. */
   forkSession(): Promise<{ command: string; args: string[] } | null>;
-  /** The agent's own transcript, as Markdown, for a `full` handoff. */
+  /** The agent's own transcript, as Markdown. */
   history(): string;
   info(): AgentInfo;
   dispose(): Promise<void>;

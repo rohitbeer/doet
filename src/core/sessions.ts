@@ -8,9 +8,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import type { Bus } from './bus.js';
-import type { SummarySource } from './config.js';
 import { DOET_HOME } from './paths.js';
-import type { DebateResult } from './conductor.js';
 import { AGENT_LABELS } from './relay.js';
 import {
   AGENT_IDS,
@@ -28,7 +26,7 @@ export const SESSIONS_DIR = join(DOET_HOME, 'sessions');
 /** How a message reached the agent, in words the transcript can keep. */
 const DELIVERY_NOTE: Record<MessageDelivery, string> = {
   live: 'delivered mid-exchange',
-  queued: 'delivered at the end of the running turn',
+
   sent: 'sent as its own turn',
 };
 
@@ -46,7 +44,6 @@ export interface SessionMeta {
   /** Missing on sessions written before modes existed; read as co-code. */
   mode?: 'co-code' | 'vs';
   agents: Record<AgentId, { sessionId?: string; model: string; effort?: Effort }>;
-  summary: { agent: SummarySource; model: string };
   base?: string;
   slots?: Record<SlotId, {
     cli: CliId;
@@ -64,7 +61,7 @@ export interface SessionMeta {
  *   <stamp>/session.md   the conversation, appended turn by turn
  *   <stamp>/claude.md    that agent's own transcript
  *   <stamp>/codex.md
- *   <stamp>/gist.md      the summary agent's latest digest
+ *   <stamp>/summary.md   the closing account of the run, from whoever spoke last
  *   <stamp>/events.jsonl every event, including permission decisions
  *
  * Written live because the markdown is not only a record: rotating an agent's
@@ -135,7 +132,6 @@ export class SessionStore {
               claude: { model: '' },
               codex: { model: '' },
             },
-            summary: { agent: 'off', model: '' },
             ...meta,
           } satisfies SessionMeta,
           null,
@@ -207,9 +203,9 @@ export class SessionStore {
   }
 
   private record(event: DoetEvent, slot?: SlotId): void {
-    // Token-level deltas would bloat the file by orders of magnitude and add
-    // nothing the complete `message` event doesn't already carry.
-    if (event.kind === 'text' || event.kind === 'thinking' || event.kind === 'output') return;
+    // Nothing to filter any more: the streaming deltas that used to flood this
+    // file never reach doet — each agent renders its own output in its own
+    // pane, and what arrives here is only what doet itself did.
     this.safely(() =>
       appendFileSync(
         this.path('events.jsonl'),
@@ -316,12 +312,12 @@ export class SessionStore {
     this.safely(() => appendFileSync(this.path('session.md'), `\n> ${note}\n`, 'utf8'));
   }
 
-  writeGist(gist: string): void {
-    this.safely(() => writeFileSync(this.path('gist.md'), `${gist}\n`, 'utf8'));
+  writeSummary(summary: string): void {
+    this.safely(() => writeFileSync(this.path('summary.md'), `${summary}\n`, 'utf8'));
   }
 
-  readGist(): string {
-    return this.read('gist.md');
+  readSummary(): string {
+    return this.read('summary.md');
   }
 
   /** Snapshots one agent's own session transcript. */
@@ -359,21 +355,6 @@ export class SessionStore {
     } catch {
       return '';
     }
-  }
-
-  /** Returns the path written, so the UI can tell the user where it went. */
-  finalize(result: DebateResult): string {
-    const path = this.path('session.md');
-    this.safely(() => {
-      appendFileSync(
-        path,
-        `\n---\n\n## Final version — ${AGENT_LABELS[result.finalFrom]}\n\n` +
-          `_${result.reason} after ${result.rounds} exchange${result.rounds === 1 ? '' : 's'}_\n\n` +
-          `${result.final}\n`,
-        'utf8',
-      );
-    });
-    return path;
   }
 
   /**

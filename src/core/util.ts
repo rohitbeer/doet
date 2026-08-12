@@ -176,12 +176,25 @@ function fittingCut(text: string, room: number, startingColumn: number): number 
   let whitespace = 0;
   for (const part of graphemes.segment(text)) {
     const width = graphemeWidth(part.segment, startingColumn + used);
-    if (used + width > room) break;
+    if (used + width > room) {
+      // The space that overflows is still a legal break, because breaking *at*
+      // it drops it: everything before it fitted. Without this case a word that
+      // ends exactly on the last column is pushed to the next row along with
+      // the space after it, and since the same thing then happens to the row
+      // below, a paragraph wraps a word narrower than the pane on every line —
+      // "the quick brown fox" at width 9 came out as "the" / "quick" / "brown".
+      if (isSpace(part.segment)) whitespace = part.index;
+      break;
+    }
     used += width;
     end = part.index + part.segment.length;
-    if (/^\s$/u.test(part.segment)) whitespace = part.index;
+    if (isSpace(part.segment)) whitespace = part.index;
   }
   return whitespace > 0 ? whitespace : end;
+}
+
+function isSpace(grapheme: string): boolean {
+  return /^\s$/u.test(grapheme);
 }
 
 function firstGraphemeEnd(text: string): number {

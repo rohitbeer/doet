@@ -16,7 +16,7 @@ export const STATUS_LABEL: Record<AgentStatus, string> = {
   ready: 'ready',
   thinking: 'thinking',
   working: 'working',
-  'awaiting-permission': 'needs you',
+
   error: 'error',
 };
 
@@ -26,9 +26,33 @@ export const STATUS_COLOR: Record<AgentStatus, string> = {
   ready: 'green',
   thinking: 'yellow',
   working: 'blue',
-  'awaiting-permission': 'red',
+
   error: 'red',
 };
 
 /** Braille spinner — one cell wide in every terminal font. */
 export const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/**
+ * Words to cycle through while an agent is mid-turn.
+ *
+ * Decorative, and worth being honest about why. doet learns what an agent did
+ * by reading the transcript the CLI writes when the turn *ends* — it never
+ * scrapes the pane to infer what is happening inside one. So this cannot
+ * describe the work, and does not try to: it is the same fixed list every time,
+ * and its only job is to make a waiting screen feel alive rather than frozen.
+ * The line that actually says something is the recap, and it arrives when the
+ * turn does.
+ */
+export const THINKING_WORDS = [
+  'deliberating',
+  'ruminating',
+  'considering',
+  'untangling',
+  'poking about',
+  'thinking it over',
+  'reading around',
+  'weighing it up',
+  'chasing a thread',
+  'sizing it up',
+];

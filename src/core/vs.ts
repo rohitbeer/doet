@@ -97,15 +97,24 @@ export class VsRunner {
     this.store.openVsQuestion(query);
 
     const startedAt = Date.now();
+    // Each side releases its own slot the moment it settles, rather than both
+    // being released when the pair does. The two slots are independent, and a
+    // slot that finished a minute ago is genuinely idle: you can message it,
+    // continue it, or take its session over without waiting on the other one.
+    // Clearing them together made the faster slot report "still finishing its
+    // last turn" for as long as the slower one ran — which is exactly the
+    // window in which you want to talk to it.
+    const pending = {} as Record<SlotId, Promise<VsSlotResult>>;
     for (const slot of SLOT_IDS) {
-      this.inflight[slot] = this.runSide(this.sides[slot], query);
+      const side: Promise<VsSlotResult> = this.runSide(this.sides[slot], query).finally(() => {
+        if (this.inflight[slot] === side) delete this.inflight[slot];
+      });
+      pending[slot] = side;
+      this.inflight[slot] = side;
     }
 
     try {
-      const [a, b] = await Promise.all([
-        this.inflight.a! as Promise<VsSlotResult>,
-        this.inflight.b! as Promise<VsSlotResult>,
-      ]);
+      const [a, b] = await Promise.all([pending.a, pending.b]);
       const result: VsResult = {
         query,
         base: this.sides.a.worktree.base,
@@ -115,7 +124,12 @@ export class VsRunner {
       this.store.finalizeVs(result, renderScoreboard(result, this.pricing));
       return result;
     } finally {
-      this.inflight = {};
+      // Belt and braces for a side that never reached its own cleanup. Guarded
+      // by identity: a solo turn started on a slot that finished early belongs
+      // to that turn, not to this run, and must not be cleared here.
+      for (const slot of SLOT_IDS) {
+        if (this.inflight[slot] === pending[slot]) delete this.inflight[slot];
+      }
     }
   }
 
@@ -174,10 +188,13 @@ export class VsRunner {
     // side of it. A caller awaiting `turn` and then asking `isRunning` has to
     // see the slot already free — with a separate chain that is a coin flip on
     // microtask ordering, and losing it leaves the UI stuck showing "running".
-    const turn = this.runSolo(side, body, `slot ${side.slot.toUpperCase()} message`)
-      .finally(() => {
-        delete this.inflight[slot];
-      });
+    const turn: Promise<TurnResult> = this.runSolo(
+      side,
+      body,
+      `slot ${side.slot.toUpperCase()} message`,
+    ).finally(() => {
+      if (this.inflight[slot] === turn) delete this.inflight[slot];
+    });
     this.inflight[slot] = turn;
     return { delivery: 'sent', turn };
   }
@@ -201,7 +218,7 @@ export class VsRunner {
     try {
       return await pending;
     } finally {
-      delete this.inflight[slot];
+      if (this.inflight[slot] === pending) delete this.inflight[slot];
     }
   }
 
@@ -304,7 +321,7 @@ export class VsRunner {
     return {
       slot: side.slot,
       cli: side.cli,
-      model: info.resolvedModel ?? info.model,
+      model: info.model,
       branch: side.worktree.branch,
       worktree: side.worktree.path,
       commit: commit.sha,
